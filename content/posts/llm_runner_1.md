@@ -51,7 +51,13 @@ The mathematical operations performed by the LLM are determined by two component
 - The _architecture_ of the LLM, which defines the operations that are successively applied to the input.
 - The _weights_ of the LLM, which are the parameters of these mathematical operations.
 
-Here we will focus on the architecture described in [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762).
+Here we will focus on the architecture described in [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762). This paper introduces the attention mechanism, which is the core of the Transformer architecture and is characterized by the use of this opperation:
+
+$$\mathrm{Attention(Q, K, V)} = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+
+Where $Q$, $K$ and $V$ are matrices called the query, key and value matrices respectively. $d_k$ is the dimension of the key and value vectors. $\mathrm{softmax}$ is the softmax function.
+
+$$\mathrm{softmax}(x) = \frac{\exp(x)}{\sum_{i=1}^{n}\exp(x_i)}$$
 
 ![The Transformer model architecture (Vaswani et al., 2017)](/assets/vas17_fig1.png)
 _The Transformer model architecture as given in [[Vas17]](https://arxiv.org/abs/1706.03762)._
