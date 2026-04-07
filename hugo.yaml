@@ -1,0 +1,106 @@
+baseURL: https://thenlevy.github.io/
+languageCode: en-us
+title: "My Blog"
+theme: PaperMod
+pagination:
+  pagerSize: 5
+
+enableRobotsTXT: true
+buildDrafts: false
+buildFuture: false
+buildExpired: false
+
+minify:
+  disableXML: true
+  minifyOutput: true
+
+params:
+  env: production
+  title: "My Blog"
+  description: "A blog about the things I learn and build (mostly in Rust)."
+  keywords: [Blog, Tech, Rust]
+  author: thenlevy
+  # author: ["Me", "You"] # multiple authors
+  # images: ["<link or path of image for opengraph, twitter-cards>"]
+  DateFormat: "January 2, 2006"
+  defaultTheme: auto
+  disableThemeToggle: false
+
+  ShowReadingTime: false
+  ShowBreadCrumbs: true
+  ShowCodeCopyButtons: true
+  UseHugoToc: true
+
+  assets:
+    disableHLJS: true
+    # favicon: "<link / abs url>"
+    # favicon16x16: "<link / abs url>"
+    # favicon32x32: "<link / abs url>"
+    # apple_touch_icon: "<link / abs url>"
+    # safari_pinned_tab: "<link / abs url>"
+
+  label:
+    text: "Home"
+    # icon: /apple-touch-icon.png
+    # iconHeight: 35
+
+  # Landing page in profile mode
+  profileMode:
+    enabled: true
+    title: "Hi, I'm Nicolas"
+    subtitle: "I am a Software engineer currently working at [Stockly](https://stockly.ai/). I write about the things I learn and build (mostly in Rust)."
+    imageUrl: "https://avatars.githubusercontent.com/thenlevy"
+    imageWidth: 120
+    imageHeight: 120
+    imageTitle: "profile picture"
+    buttons:
+      - name: Posts
+        url: posts
+      - name: About
+        url: about
+
+  socialIcons:
+    - name: github
+      url: "https://github.com/thenlevy"
+    - name: linkedin
+      url: "https://linkedin.com/in/nicolaspierrelevy"
+
+  analytics:
+    google:
+      SiteVerificationTag: ""
+
+  cover:
+    hidden: true
+    hiddenInList: true
+    hiddenInSingle: true
+
+  fuseOpts:
+    isCaseSensitive: false
+    shouldSort: true
+    location: 0
+    distance: 1000
+    threshold: 0.4
+    minMatchCharLength: 0
+    limit: 10
+    keys: ["title", "permalink", "summary", "content"]
+
+menu:
+  main:
+    - identifier: posts
+      name: Posts
+      url: /posts/
+      weight: 10
+    - identifier: about
+      name: About
+      url: /about/
+      weight: 20
+    - identifier: search
+      name: Search
+      url: /search/
+      weight: 30
+
+outputs:
+  home:
+    - HTML
+    - RSS
+    - JSON
