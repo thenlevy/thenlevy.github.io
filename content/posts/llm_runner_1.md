@@ -6,13 +6,13 @@ description: "Understanding how LLMs work by implementing an encoder in Rust."
 ---
 
 Recently, I've started a journey to "understand how LLMs work".
-Implementing something is a good way to understand it, so I've started the [`llm_runner`](https://github.com/thenlevy/llm_runner) project.
+Implementing something is a good way to understand it, so I've started the [`llm-runner`](https://github.com/thenlevy/llm-runner) project.
 
 To start this project, it was natural to start with the architecture described in the fundamental paper _Attention is all you need_ [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762).
 
-In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust.
+In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
 
-Later, we'll parse an actual model and make a program that runs it on user-written prompts.
+In the next post, we'll see how we parse an actual model and make a program that runs it on user-written prompts.
 
 # What is a LLM?
 
@@ -76,9 +76,9 @@ fn softmax(x: &[f32]) -> Vec<f32> {
     // Directly translating the above formula would lead to computing exponential of large
     // numbers, leading to numeric instability (esp on `f32`s).
     // This implementation is mathematically equivalent, but more stable.
-    let max = x.iter().max().unwrap();
-    let sum = x.iter().map(|x| (x - max).exp()).sum();
-    x.iter().map(|x| exp(x - max) / sum).collect()
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = x.iter().map(|&xi| (xi - max).exp()).sum();
+    x.iter().map(|&xi| (xi - max).exp() / sum).collect()
 }
 ```
 
@@ -124,14 +124,21 @@ and $\mathrm{LayerNorm}$ is applied **row-wise** to $M(x)$.
 
 $\mathrm{LayerNorm}$ is layer normalization along the feature dimension of each row; see [here](<https://en.wikipedia.org/wiki/Normalization_(machine_learning)#Layer_normalization>) and the Rust code below for the definition.
 
+`src/layers/embeddings.rs`:
+
 ```rust
-// Matrix is a wrapper around nalgebra::DMatrix<f32> with parsing convenience methods.
+//! Embeddings layer
+
+use crate::{
+    Error,
+    layers::{Matrix, Norm},
+};
+
+use nalgebra::DMatrix;
 
 pub struct Embeddings {
     pub norm: Norm,
-    /// Constant parameters, not updated during training.
     pub positions: Matrix,
-    /// Learnt parameters, updated during training.
     pub words: Matrix,
 }
 
@@ -157,19 +164,41 @@ impl Embeddings {
         Ok(embeddings)
     }
 }
+```
 
-// Vector is a wrapper around nalgebra::DVector<f32> with parsing convenience methods.
+`src/layers/norm.rs`:
+
+```rust
+use crate::{Error, layers::Vector};
+
+use {
+    nalgebra::{DMatrix, DVector, DVectorViewMut},
+    safetensors::tensor::TensorView,
+};
 
 pub struct Norm {
-    /// Learnt parameters unique to each layer, updated during training.
     bias: Vector,
-    /// Learnt parameters unique to each layer, updated during training.
     weight: Vector,
-    /// Constant parameter across the whole Model, not updated during training.
     epsilon: f32,
 }
 
 impl Norm {
+    pub fn try_from_views(
+        bias: TensorView<'_>,
+        weights: TensorView<'_>,
+        epsilon: f32,
+    ) -> Result<Self, Error> {
+        let bias = Vector::try_from_view(bias, None)?;
+        let len = bias.len();
+        let weight = Vector::try_from_view(weights, Some(len))?;
+
+        Ok(Self {
+            bias,
+            weight,
+            epsilon,
+        })
+    }
+
     pub fn shape(&self) -> usize {
         self.bias.len()
     }
@@ -195,16 +224,24 @@ impl Norm {
     }
 
     pub fn normalize_rows(&self, rows: &mut DMatrix<f32>) -> Result<(), Error> {
-        let (_, n_cols) = rows.shape();
+        let (nrows, n_cols) = rows.shape();
 
         if n_cols != self.shape() {
             return Err(Error::InconsistentShape);
         }
 
-        rows.row_iter_mut().try_for_each(|mut row| {
-            self.normalize_row(&mut row.as_view_mut())?;
-            Ok(())
-        })
+        let mut buf = vec![0.0f32; n_cols];
+        for i in 0..nrows {
+            for j in 0..n_cols {
+                buf[j] = rows[(i, j)];
+            }
+            let mut view = DVectorViewMut::from_slice(&mut buf, n_cols);
+            self.normalize_row(&mut view)?;
+            for j in 0..n_cols {
+                rows[(i, j)] = buf[j];
+            }
+        }
+        Ok(())
     }
 }
 ```
@@ -255,7 +292,18 @@ $$
 
 Where $W^O$ and $b^O$ are learned weights and bias specific to each attention layer.
 
+`src/layers/attention.rs` (`linear` and `add_bias_rows` live in `src/layers/mod.rs`):
+
 ```rust
+//! Attention layer
+
+use crate::{
+    Error,
+    layers::{Matrix, Vector, add_bias_rows, linear},
+};
+
+use {nalgebra::DMatrix, safetensors::tensor::TensorView};
+
 pub struct Attention {
     pub q_weights: Matrix,
     pub q_bias: Vector,
@@ -267,8 +315,36 @@ pub struct Attention {
     pub out_bias: Vector,
 }
 
+pub struct AttentionViews<'a> {
+    pub q_weights: TensorView<'a>,
+    pub k_weights: TensorView<'a>,
+    pub v_weights: TensorView<'a>,
+    pub out_weights: TensorView<'a>,
+    pub q_bias: TensorView<'a>,
+    pub k_bias: TensorView<'a>,
+    pub v_bias: TensorView<'a>,
+    pub out_bias: TensorView<'a>,
+}
+
 impl Attention {
-    pub fn forward_multi_headed(&self, x: DMatrix<f32>, n_heads: usize) -> Result<DMatrix<f32>, Error> {
+    pub fn try_from_views(views: AttentionViews, d_model: usize) -> Result<Self, Error> {
+        Ok(Self {
+            q_bias: Vector::try_from_view(views.q_bias, Some(d_model))?,
+            k_bias: Vector::try_from_view(views.k_bias, Some(d_model))?,
+            v_bias: Vector::try_from_view(views.v_bias, Some(d_model))?,
+            out_bias: Vector::try_from_view(views.out_bias, Some(d_model))?,
+            q_weights: Matrix::try_from_view(views.q_weights, [Some(d_model), Some(d_model)])?,
+            k_weights: Matrix::try_from_view(views.k_weights, [Some(d_model), Some(d_model)])?,
+            v_weights: Matrix::try_from_view(views.v_weights, [Some(d_model), Some(d_model)])?,
+            out_weights: Matrix::try_from_view(views.out_weights, [Some(d_model), Some(d_model)])?,
+        })
+    }
+
+    pub fn forward_multi_headed(
+        &self,
+        x: DMatrix<f32>,
+        n_heads: usize,
+    ) -> Result<DMatrix<f32>, Error> {
         let (seq, d_model) = x.shape();
         if d_model != self.q_weights.shape()[1] {
             return Err(Error::InconsistentShape);
@@ -279,16 +355,13 @@ impl Attention {
         let d_head = d_model / n_heads;
         let scale = 1.0 / (d_head as f32).sqrt();
 
-        // We store the queries, keys, and values for all heads in the same matrix that will be split later.
-        let q = linear(&x, &self.q_weights, &self.q_bias)?;
-        let k = linear(&x, &self.k_weights, &self.k_bias)?;
-        let v = linear(&x, &self.v_weights, &self.v_bias)?;
+        let q = linear(&x, &self.q_weights, &self.q_bias);
+        let k = linear(&x, &self.k_weights, &self.k_bias);
+        let v = linear(&x, &self.v_weights, &self.v_bias);
 
         let mut attended = DMatrix::zeros(seq, d_model);
         for h in 0..n_heads {
             let c0 = h * d_head;
-
-            // Extract the queries, keys, and values for the current head.
             let qh = q.view((0, c0), (seq, d_head));
             let kh = k.view((0, c0), (seq, d_head));
             let vh = v.view((0, c0), (seq, d_head));
@@ -298,39 +371,30 @@ impl Attention {
             softmax_rows(&mut scores);
 
             let ctx = &scores * &vh;
-
-            // Copy the attended values for the current head into the output matrix.
             attended.view_mut((0, c0), (seq, d_head)).copy_from(&ctx);
         }
 
         let mut out = attended * self.out_weights.transpose();
-        add_bias_rows(&mut out, &self.out_bias)?;
+        add_bias_rows(&mut out, &self.out_bias);
         Ok(out)
     }
 }
 
-fn linear(x: &DMatrix<f32>, w: &Matrix, b: &Vector) -> DMatrix<f32> {
-    let mut y = x * w.transpose();
-    add_bias_rows(&mut y, b);
-    y
-}
-
-fn add_bias_rows(m: &mut DMatrix<f32>, bias: &DVector<f32>) {
-    for mut row in m.row_iter_mut() {
-        row += bias;
-    }
-}
-
 fn softmax_rows(mat: &mut DMatrix<f32>) {
-    for mut row in mat.row_iter_mut() {
-        let max_v = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
-
-        let sum = row.iter().map(|&x| (x - max_v).exp()).sum::<f32>();
-
-        row.scale_mut(1.0 / sum);
+    let (nrows, ncols) = mat.shape();
+    let mut buf = vec![0.0f32; ncols];
+    for i in 0..nrows {
+        for j in 0..ncols {
+            buf[j] = mat[(i, j)];
+        }
+        let max_v = buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = buf.iter().map(|&x| (x - max_v).exp()).sum();
+        let scale = 1.0 / sum;
+        for j in 0..ncols {
+            mat[(i, j)] = (buf[j] - max_v).exp() * scale;
+        }
     }
 }
-
 ```
 
 ### Feed-Forward Network
@@ -351,7 +415,18 @@ $$
 
 (The original Transformer FFN in [[Vas17]](https://arxiv.org/abs/1706.03762) uses $\mathrm{ReLU}$; models such as BERT and DistilBERT use $\mathrm{GeLU}$ instead. The formula above is the exact $\mathrm{GeLU}$ definition; the Rust snippet below uses the usual tanh-based approximation to it.)
 
+`src/layers/ffn.rs` (`apply_gelu` is imported from `src/layers/mod.rs`):
+
 ```rust
+//! Feed-forward network layer
+
+use crate::{
+    Error,
+    layers::{Matrix, Vector, add_bias_rows, apply_gelu},
+};
+
+use {nalgebra::DMatrix, safetensors::tensor::TensorView};
+
 pub struct Ffn {
     pub linear_1: Matrix,
     pub linear_2: Matrix,
@@ -359,7 +434,26 @@ pub struct Ffn {
     pub bias_2: Vector,
 }
 
+pub struct FfnViews<'a> {
+    pub linear_1: TensorView<'a>,
+    pub linear_2: TensorView<'a>,
+    pub bias_1: TensorView<'a>,
+    pub bias_2: TensorView<'a>,
+}
+
 impl Ffn {
+    pub fn try_from_views(views: FfnViews, d_model: usize) -> Result<Self, Error> {
+        let linear_1 = Matrix::try_from_view(views.linear_1, [None, Some(d_model)])?;
+        let hidden_dimension = Some(linear_1.shape()[0]);
+
+        Ok(Self {
+            linear_1,
+            linear_2: Matrix::try_from_view(views.linear_2, [Some(d_model), hidden_dimension])?,
+            bias_1: Vector::try_from_view(views.bias_1, hidden_dimension)?,
+            bias_2: Vector::try_from_view(views.bias_2, Some(d_model))?,
+        })
+    }
+
     pub fn forward(&self, x: DMatrix<f32>) -> Result<DMatrix<f32>, Error> {
         let (_, n_cols) = x.shape();
         if n_cols != self.linear_1.shape()[1] {
@@ -372,15 +466,8 @@ impl Ffn {
 
         let mut z = y * self.linear_2.transpose();
         add_bias_rows(&mut z, &self.bias_2);
-        Ok(z)
-    }
-}
 
-fn apply_gelu(x: &mut DMatrix<f32>) {
-    // This is an approximation of the GeLU function that is smoother and has a better gradient, as used in BERT.
-    for x in x.iter_mut() {
-        let u = std::f32::consts::FRAC_2_PI.sqrt() * (*x + 0.044715 * x.powi(3));
-        *x = 0.5 * *x * (1.0 + u.tanh())
+        Ok(z)
     }
 }
 ```
@@ -403,7 +490,18 @@ We can now put all these pieces together to implement a function that evaluates 
 
 In the next post, we will parse an actual model and make a program that runs it on user-written prompts.
 
+`src/distilbert/structs.rs`:
+
 ```rust
+//! Structures for the DistilBERT model.
+
+use crate::{
+    Error,
+    layers::{Attention, Embeddings, Ffn, Matrix, Norm, Vector, apply_gelu, linear},
+};
+
+use nalgebra::DMatrix;
+
 pub struct DistilBert {
     pub embeddings: Embeddings,
     pub encoder: Vec<Stack>,
@@ -430,14 +528,12 @@ pub struct VocabLayer {
 }
 
 impl DistilBert {
-
     pub fn evaluate(&self, input: &[u32]) -> Result<DMatrix<f32>, Error> {
         let mut output = self.embeddings.embed(input)?;
         for stack in &self.encoder {
+            // TransformerBlock: sa_layer_norm(attn(x) + x), then output_layer_norm(ffn(h) + h)
             let residual = output.clone();
-            let attn_out = stack
-                .attention
-                .forward_multi_headed(output, self.n_heads)?;
+            let attn_out = stack.attention.forward_multi_headed(output, self.n_heads)?;
             let mut h = attn_out + residual;
             stack.attention_norm.normalize_rows(&mut h)?;
 
@@ -448,6 +544,7 @@ impl DistilBert {
             output = h;
         }
 
+        // DistilBertForMaskedLM: transform → activation → vocab_layer_norm → projector
         let mut h = linear(
             &output,
             &self.vocab_layer.transform,
