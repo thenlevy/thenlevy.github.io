@@ -53,11 +53,21 @@ The mathematical operations performed by the LLM are determined by two component
 - The _architecture_ of the LLM, which defines the operations that are successively applied to the input.
 - The _weights_ of the LLM, which are the parameters of these mathematical operations.
 
-Here we will focus on the architecture described in [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762). This paper introduces the Transformer architecture, which leverage the attention mechanism, that is to say the use of this opperation:
+Here we will focus on the architecture described in [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762). This paper introduces the Transformer architecture, which leverages the attention mechanism—that is, the use of this operation:
 
 $$\mathrm{Attention(Q, K, V)} = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
-Where $Q$, $K$ and $V$ are matrices called the _query_, _key_ and _value_ matrices respectively. $d_k$ is the dimension of the key and value vectors. $\mathrm{softmax}$ is the softmax function.
+Where $Q$, $K$, and $V$ are the _query_, _key_, and _value_ matrices. For now we ignore multi-head attention and work with a **single head**, so $d_k = d_{\mathrm{model}}$ and $Q$, $K$, and $V$ each lie in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$. $\mathrm{softmax}$ is the softmax function.
+
+The output of the attention operation is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ whose rows are a contextualized representation of the input sequence: each position aggregates information from the whole sequence according to the attention weights.
+
+- Each row of the query matrix $Q$ is the vector at that position that encodes what information it seeks from the rest of the sequence.
+
+- Each row of the key matrix $K$ is the vector that pairs with queries to score compatibility between positions; together, $Q$ and $K$ determine how strongly each position attends to every other.
+
+- Each row of the value matrix $V$ is the vector whose content is mixed into the output when that position is attended to.
+
+The $\mathrm{softmax}$ function maps the raw scores to a probability distribution over the positions.
 
 $$\mathrm{softmax}(x) = \frac{\exp(x)}{\sum_{i=1}^{n}\exp(x_i)}$$
 
@@ -81,7 +91,8 @@ The _encoder_ is responsible for encoding the input sequence into a sequence of 
 
 $$\mathrm{encoder}: T^{\mathrm{seq\_len}} \rightarrow H^{\mathrm{seq\_len}}$$
 
-Where $H$ is the _hidden state_ space. Vectors in $H$ embed a contextualized representation of the input sequence. This contextual representation is to be understood in the context of the attention mechanism, which is the core of the Transformer architecture and is described bellow.
+Where $H=\mathbb{R}^{d_{\mathrm{model}}}$ is the _hidden state_ space of dimension $d_{\mathrm{model}}$.
+Vectors in $H$ embed a contextualized representation of the input sequence in a space of dimension $d_{\mathrm{model}}$.
 
 The _decoder_ is responsible for generating the output sequence from the hidden states. It can be seen as a function
 
@@ -89,16 +100,31 @@ $$\mathrm{decoder}: H^{\mathrm{seq\_len}} \times T^{n_{\mathrm{out}}} \rightarro
 
 That will use the output of the encoder and the tokens of the output sequence so far to generate the next token in the sequence.
 
-In reality, the element of the input and output sequences do not live in the space of tokens, but in a space of _embeddings_ $E=\mathbb{R}^{n_E \times n_E}$. Where $n_E$ is smaller than $n_T$.
+## Embeddings
 
-This means that the input is embedded in $E$ before being passed to the encoder. This embedding is defined as
+![The embedding layer](/assets/vas17_embedding.png)
+_The embedding layer as given in [[Vas17]](https://arxiv.org/abs/1706.03762)._
 
-$$\mathrm{embedding}: \{0, 1\}^{\mathrm{seq\_len}} \rightarrow E$$
-$$\mathrm{embedding}(x) = \mathrm{LayerNorm}(xW_e + P_e) $$
+In reality, the elements of the input and output sequences are not manipulated as discrete tokens inside the model, but as vectors in a real _embedding_ space $\mathbb{R}^{d_{\mathrm{model}}}$ where
+$d_{\mathrm{model}}$ is a fixed constant for the model, typically much smaller than the vocabulary size $n_T$.
 
-Where $W_e \in \mathbb{R}^{\mathrm{seq\_len} \times n_E}$ is the _learnt_ matrix of embeddings and $P_e\in \mathbb{R}^{\mathrm{seq\_len} \times n_E}$ is a constant matrix of _positional encodings_, whose role is to encode information about the position of the tokens in the sequence within the embedding.
+A sequence of length $\mathrm{seq\_len}$ is therefore represented as a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$: one $d_{\mathrm{model}}$-dimensional row per position.
+The embedding layer maps a sequence of token indices to such a matrix.
 
-And $\mathrm{LayerNorm}$ is a layer normalization operation defined [here](<https://en.wikipedia.org/wiki/Normalization_(machine_learning)#Layer_normalization>) (see also the rust code bellow for definition).
+In practice, the sequence of tokens of length $\leq \mathrm{seq\_len}$ is represented as a vector $x \in \{0,\ldots,n_T-1\}^{\mathrm{seq\_len}}$ with $x_i$ the id of the token at position $i$.
+
+The embedding is then computed as follows:
+Let $W_e \in \mathbb{R}^{n_T \times d_{\mathrm{model}}}$ be the learnt _token embedding_ matrix (row $j$ is the vector for token $j$) and let $P_e \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ be the matrix of _positional encodings_ for those positions (fixed or learnt), so that each row encodes where the token sits in the sequence.
+
+Then
+
+$$\mathrm{embedding}: \{0,\ldots,n_T-1\}^{\mathrm{seq\_len}} \rightarrow \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$$
+
+$$\mathrm{embedding}(x) = \mathrm{LayerNorm}(M(x)) \quad\text{where}\quad M(x)_{i,:} = (W_e)_{x_i,:} + (P_e)_{i,:}$$
+
+and $\mathrm{LayerNorm}$ is applied **row-wise** to $M(x)$.
+
+$\mathrm{LayerNorm}$ is layer normalization along the feature dimension of each row; see [here](<https://en.wikipedia.org/wiki/Normalization_(machine_learning)#Layer_normalization>) and the Rust code below for the definition.
 
 ```rust
 // Matrix is a wrapper around nalgebra::Dmatrix<f32> with parsing convenience methods.
@@ -183,4 +209,180 @@ impl Norm {
         })
     }
 }
+```
+
+## The Encoder Stack
+
+The encoder is a stack of $N$ identical layers applied one after another. Each layer is a fixed pattern:
+
+- First a _multi-head self-attention_ block that computes how every position attend to every position
+- Then, a _position-wise feed-forward network (FFN)_ that further refines each position’s vector on its own: it takes the representation that attention has already contextualized and processes it in place, enriching what that slot encodes without pulling in information from other positions.
+
+Writing $X \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ for the layer input, one encoder layer (in the _post-norm_ style of [[Vas17]](https://arxiv.org/abs/1706.03762)) looks like
+
+$$
+\begin{aligned}
+X' &= \mathrm{LayerNorm}\bigl(X + \mathrm{MultiHead}(X)\bigr) \\
+X'' &= \mathrm{LayerNorm}\bigl(X' + \mathrm{FFN}(X')\bigr)\,.
+\end{aligned}
+$$
+
+The fact that $X$ is added to the output of the attention block and $X'$ is added to the output of the FFN block is reffered to as _residual connections_ and represented by arrows that skip the Attention/FFN blocks.
+
+![The encoder stack](/assets/vas17_encoder.png)
+_The encoder stack as given in [[Vas17]](https://arxiv.org/abs/1706.03762). The input is forwarded to a MultiHead attention block and a FFN block, and the output of these blocks are normalized with residual connections._
+
+### Multi-head attention
+
+The single-head picture from earlier uses $d_k = d_{\mathrm{model}}$. In practice the model splits that width into several heads so it can attend in different representation subspaces in parallel.
+
+Let $h$ be the number of heads. For each head $i$, the same sequence $X$ is mapped into that head’s queries, keys, and values by an affine map (matrix multiply plus bias, the bias broadcast to every row of $X$):
+
+$$
+Q_i = X W_i^Q + b_i^Q,\quad K_i = X W_i^K + b_i^K,\quad V_i = X W_i^V + b_i^V\,.
+$$
+
+The $W_i^Q, W_i^K, W_i^V$ and $b_i^Q, b_i^K, b_i^V$ are learned weights and biases specific to each head of each attention layer.
+
+The shapes of $W_i^Q, W_i^K, W_i^V$ and $b_i^Q, b_i^K, b_i^V$ match $X \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ so that $Q_i$ and $K_i$ have $d_k$ columns and $V_i$ has $d_v$ columns. The output of one head is then the usual attention:
+
+$$
+\mathrm{head}_i = \mathrm{Attention}(Q_i, K_i, V_i)\,.
+$$
+
+The heads are then concatenated and mapped back to $d_{\mathrm{model}}$ with another affine map:
+
+$$
+\mathrm{MultiHead}(X) = \mathrm{Concat}(\mathrm{head}_1, \ldots, \mathrm{head}_h)\, W^O + b^O\,.
+$$
+
+Where $W^O$ and $b^O$ are learned weights and bias specific to each attention layer.
+
+```rust
+pub struct Attention {
+    pub q_weights: Matrix,
+    pub q_bias: Vector,
+    pub k_weights: Matrix,
+    pub k_bias: Vector,
+    pub v_weights: Matrix,
+    pub v_bias: Vector,
+    pub out_weights: Matrix,
+    pub out_bias: Vector,
+}
+
+impl Attention {
+    pub fn forward_multi_headed(&self, x: DMatrix<f32>, n_heads: usize) -> Result<DMatrix<f32>, Error> {
+        let (seq, d_model) = x.shape();
+        if d_model != self.q_weights.shape()[1] {
+            return Err(Error::InconsistentShape);
+        }
+        if n_heads == 0 || d_model % n_heads != 0 {
+            return Err(Error::InconsistentShape);
+        }
+        let d_head = d_model / n_heads;
+        let scale = 1.0 / (d_head as f32).sqrt();
+
+        // We store the queries, keys, and values for all heads in the same matrix that will be split later.
+        let q = linear(&x, &self.q_weights, &self.q_bias)?;
+        let k = linear(&x, &self.k_weights, &self.k_bias)?;
+        let v = linear(&x, &self.v_weights, &self.v_bias)?;
+
+        let mut attended = DMatrix::zeros(seq, d_model);
+        for h in 0..n_heads {
+            let c0 = h * d_head;
+
+            // Extract the queries, keys, and values for the current head.
+            let qh = q.view((0, c0), (seq, d_head));
+            let kh = k.view((0, c0), (seq, d_head));
+            let vh = v.view((0, c0), (seq, d_head));
+
+            let mut scores = &qh * &kh.transpose();
+            scores.scale_mut(scale);
+            softmax_rows(&mut scores);
+
+            let ctx = &scores * &vh;
+
+            // Copy the attended values for the current head into the output matrix.
+            attended.view_mut((0, c0), (seq, d_head)).copy_from(&ctx);
+        }
+
+        let mut out = attended * self.out_weights.transpose();
+        add_bias_rows(&mut out, &self.out_bias)?;
+        Ok(out)
+    }
+}
+
+fn linear(x: &DMatrix<f32>, w: &Matrix, b: &Vector) -> DMatrix<f32> {
+    let mut y = x * w.transpose();
+    add_bias_rows(&mut y, b);
+    y
+}
+
+fn add_bias_rows(m: &mut DMatrix<f32>, bias: &DVector<f32>) {
+    for mut row in m.row_iter_mut() {
+        row += bias;
+    }
+}
+
+fn softmax_rows(mat: &mut DMatrix<f32>) {
+    for mut row in mat.row_iter_mut() {
+        let max_v = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
+
+        let sum = row.iter().map(|&x| (x - max_v).exp()).sum::<f32>();
+
+        row.scale_mut(1.0 / sum);
+    }
+}
+
+```
+
+### Feed-Forward Network
+
+The FFN is a two-layer MLP that is applied row-wise to the input.
+
+$$
+\mathrm{FFN}(X) = \mathrm{GeLU}(X W_1 + b_1) W_2 + b_2\,.
+$$
+
+Where $W_1, W_2$ and $b_1, b_2$ are learned weights and biases specific to the FFN.
+
+$\mathrm{GeLU}$ is the Gaussian Error Linear Unit function:
+
+$$
+\mathrm{GeLU}(x) = 0.5 x (1 + \mathrm{erf}(x / \sqrt{2}))\,.
+$$
+
+($\mathrm{GeLU}$ is an approximation of the $\mathrm{ReLU}$ function used in [[Vas17]](https://arxiv.org/abs/1706.03762), that is more smooth and has a better gradient.)
+
+```rust
+pub struct Ffn {
+    pub linear_1: Matrix,
+    pub linear_2: Matrix,
+    pub bias_1: Vector,
+    pub bias_2: Vector,
+}
+
+pub fn forward(&self, x: DMatrix<f32>) -> Result<DMatrix<f32>, Error> {
+    let (_, n_cols) = x.shape();
+    if n_cols != self.linear_1.shape()[1] {
+        return Err(Error::InconsistentShape);
+    }
+
+    let mut y = x * self.linear_1.transpose();
+    add_bias_rows(&mut y, &self.bias_1);
+    apply_gelu(&mut y);
+
+    let mut z = y * self.linear_2.transpose();
+    add_bias_rows(&mut z, &self.bias_2);
+    Ok(z)
+}
+
+fn apply_gelu(x: &mut DMatrix<f32>) {
+    // This is an approximation of the GeLU function that is more smooth and has a better gradient, that is used in BERT.
+    for x in x.iter_mut() {
+        let u = std::f32::consts::FRAC_2_PI.sqrt() * (*x + 0.044715 * x.powi(3));
+        *x = 0.5 * *x * (1.0 + u.tanh())
+    }
+}
+
 ```
