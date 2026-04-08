@@ -183,22 +183,6 @@ pub struct Norm {
 }
 
 impl Norm {
-    pub fn try_from_views(
-        bias: TensorView<'_>,
-        weights: TensorView<'_>,
-        epsilon: f32,
-    ) -> Result<Self, Error> {
-        let bias = Vector::try_from_view(bias, None)?;
-        let len = bias.len();
-        let weight = Vector::try_from_view(weights, Some(len))?;
-
-        Ok(Self {
-            bias,
-            weight,
-            epsilon,
-        })
-    }
-
     pub fn shape(&self) -> usize {
         self.bias.len()
     }
@@ -315,31 +299,7 @@ pub struct Attention {
     pub out_bias: Vector,
 }
 
-pub struct AttentionViews<'a> {
-    pub q_weights: TensorView<'a>,
-    pub k_weights: TensorView<'a>,
-    pub v_weights: TensorView<'a>,
-    pub out_weights: TensorView<'a>,
-    pub q_bias: TensorView<'a>,
-    pub k_bias: TensorView<'a>,
-    pub v_bias: TensorView<'a>,
-    pub out_bias: TensorView<'a>,
-}
-
 impl Attention {
-    pub fn try_from_views(views: AttentionViews, d_model: usize) -> Result<Self, Error> {
-        Ok(Self {
-            q_bias: Vector::try_from_view(views.q_bias, Some(d_model))?,
-            k_bias: Vector::try_from_view(views.k_bias, Some(d_model))?,
-            v_bias: Vector::try_from_view(views.v_bias, Some(d_model))?,
-            out_bias: Vector::try_from_view(views.out_bias, Some(d_model))?,
-            q_weights: Matrix::try_from_view(views.q_weights, [Some(d_model), Some(d_model)])?,
-            k_weights: Matrix::try_from_view(views.k_weights, [Some(d_model), Some(d_model)])?,
-            v_weights: Matrix::try_from_view(views.v_weights, [Some(d_model), Some(d_model)])?,
-            out_weights: Matrix::try_from_view(views.out_weights, [Some(d_model), Some(d_model)])?,
-        })
-    }
-
     pub fn forward_multi_headed(
         &self,
         x: DMatrix<f32>,
@@ -368,6 +328,8 @@ impl Attention {
 
             let mut scores = &qh * &kh.transpose();
             scores.scale_mut(scale);
+
+            // Apply softmax transformation on each row of the scores matrix.
             softmax_rows(&mut scores);
 
             let ctx = &scores * &vh;
@@ -377,22 +339,6 @@ impl Attention {
         let mut out = attended * self.out_weights.transpose();
         add_bias_rows(&mut out, &self.out_bias);
         Ok(out)
-    }
-}
-
-fn softmax_rows(mat: &mut DMatrix<f32>) {
-    let (nrows, ncols) = mat.shape();
-    let mut buf = vec![0.0f32; ncols];
-    for i in 0..nrows {
-        for j in 0..ncols {
-            buf[j] = mat[(i, j)];
-        }
-        let max_v = buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = buf.iter().map(|&x| (x - max_v).exp()).sum();
-        let scale = 1.0 / sum;
-        for j in 0..ncols {
-            mat[(i, j)] = (buf[j] - max_v).exp() * scale;
-        }
     }
 }
 ```
@@ -434,26 +380,8 @@ pub struct Ffn {
     pub bias_2: Vector,
 }
 
-pub struct FfnViews<'a> {
-    pub linear_1: TensorView<'a>,
-    pub linear_2: TensorView<'a>,
-    pub bias_1: TensorView<'a>,
-    pub bias_2: TensorView<'a>,
-}
 
 impl Ffn {
-    pub fn try_from_views(views: FfnViews, d_model: usize) -> Result<Self, Error> {
-        let linear_1 = Matrix::try_from_view(views.linear_1, [None, Some(d_model)])?;
-        let hidden_dimension = Some(linear_1.shape()[0]);
-
-        Ok(Self {
-            linear_1,
-            linear_2: Matrix::try_from_view(views.linear_2, [Some(d_model), hidden_dimension])?,
-            bias_1: Vector::try_from_view(views.bias_1, hidden_dimension)?,
-            bias_2: Vector::try_from_view(views.bias_2, Some(d_model))?,
-        })
-    }
-
     pub fn forward(&self, x: DMatrix<f32>) -> Result<DMatrix<f32>, Error> {
         let (_, n_cols) = x.shape();
         if n_cols != self.linear_1.shape()[1] {
