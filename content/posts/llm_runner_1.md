@@ -1,18 +1,18 @@
 ---
 date: "2026-04-07T20:47:29+02:00"
 draft: true
-title: "`llm_runner` Part I: Loading and evaluating an Encoder"
-description: "From Attention is all you need to a minimal Rust runner that loads weights and runs the encoder."
+title: "`llm_runner` Part I: Implementing an Encoder in Rust"
+description: "Understanding how LLMs work by implementing an encoder in Rust."
 ---
 
-Recently, I've started a journey to "understand how LLM work".
+Recently, I've started a journey to "understand how LLMs work".
 Implementing something is a good way to understand it, so I've started the [`llm_runner`](https://github.com/thenlevy/llm_runner) project.
 
 To start this project, it was natural to start with the architecture described in the fundamental paper _Attention is all you need_ [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762).
 
 In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust.
 
-Later, we'll parse an actual model and make a programm that runs it on user-written prompts.
+Later, we'll parse an actual model and make a program that runs it on user-written prompts.
 
 # What is a LLM?
 
@@ -37,7 +37,7 @@ This would for example look like
 ```rust
 fn infer(tokens: &mut Vec<Token>, n: usize) {
     for _ in 0..n {
-        let output = llm(token.as_slice());
+        let output = llm(tokens.as_slice());
 
         // Alternatively, sample output as a probability distribution.
         let argmax = output.iter().enumerate().max_by_key(|(_, &x)| x).unwrap().0;
@@ -63,7 +63,7 @@ The output of the attention operation is a matrix in $\mathbb{R}^{\mathrm{seq\_l
 
 - Each row of the query matrix $Q$ is the vector at that position that encodes what information it seeks from the rest of the sequence.
 
-- Each row of the key matrix $K$ is the vector that pairs with queries to score compatibility between positions; together, $Q$ and $K$ determine how strongly each position attends to every other.
+- Each row of the key matrix $K$ is the vector that pairs with queries to score compatibility between positions; together, $Q$ and $K$ determine how strongly each position attends to every position in the sequence (including itself).
 
 - Each row of the value matrix $V$ is the vector whose content is mixed into the output when that position is attended to.
 
@@ -73,7 +73,7 @@ $$\mathrm{softmax}(x) = \frac{\exp(x)}{\sum_{i=1}^{n}\exp(x_i)}$$
 
 ```rust
 fn softmax(x: &[f32]) -> Vec<f32> {
-    // Directly tranlating the above forumula would lead to computing exponential of large
+    // Directly translating the above formula would lead to computing exponential of large
     // numbers, leading to numeric instability (esp on `f32`s).
     // This implementation is mathematically equivalent, but more stable.
     let max = x.iter().max().unwrap();
@@ -82,8 +82,7 @@ fn softmax(x: &[f32]) -> Vec<f32> {
 }
 ```
 
-![The Transformer model architecture (Vaswani et al., 2017)](/assets/vas17_fig1.png)
-_The Transformer model architecture as given in [[Vas17]](https://arxiv.org/abs/1706.03762)._
+{{< figure src="/assets/vas17_fig1.png" align="center" alt="The Transformer model architecture (Vaswani et al., 2017)" caption="The Transformer model architecture as given in [Vas17](https://arxiv.org/abs/1706.03762)." >}}
 
 This schema describes the _architecture_ of a _Transformer_ model. It is composed of two stacks: an _encoder_ and a _decoder_.
 
@@ -102,8 +101,7 @@ That will use the output of the encoder and the tokens of the output sequence so
 
 ## Embeddings
 
-![The embedding layer](/assets/vas17_embedding.png)
-_The embedding layer as given in [[Vas17]](https://arxiv.org/abs/1706.03762)._
+{{< figure src="/assets/vas17_embedding.png" align="center" alt="The embedding layer" caption="The embedding layer as given in [Vas17](https://arxiv.org/abs/1706.03762)." >}}
 
 In reality, the elements of the input and output sequences are not manipulated as discrete tokens inside the model, but as vectors in a real _embedding_ space $\mathbb{R}^{d_{\mathrm{model}}}$ where
 $d_{\mathrm{model}}$ is a fixed constant for the model, typically much smaller than the vocabulary size $n_T$.
@@ -127,7 +125,7 @@ and $\mathrm{LayerNorm}$ is applied **row-wise** to $M(x)$.
 $\mathrm{LayerNorm}$ is layer normalization along the feature dimension of each row; see [here](<https://en.wikipedia.org/wiki/Normalization_(machine_learning)#Layer_normalization>) and the Rust code below for the definition.
 
 ```rust
-// Matrix is a wrapper around nalgebra::Dmatrix<f32> with parsing convenience methods.
+// Matrix is a wrapper around nalgebra::DMatrix<f32> with parsing convenience methods.
 
 pub struct Embeddings {
     pub norm: Norm,
@@ -167,8 +165,8 @@ pub struct Norm {
     bias: Vector,
     /// Learnt parameters unique to each layer, updated during training.
     weight: Vector,
-    /// Constant parameter accross the whole Model, not updated during training.
-    espilon: f32,
+    /// Constant parameter across the whole Model, not updated during training.
+    epsilon: f32,
 }
 
 impl Norm {
@@ -183,7 +181,7 @@ impl Norm {
         }
 
         let mean = row.mean();
-        let inv_std = 1.0 / (row.variance() + self.espilon).sqrt();
+        let inv_std = 1.0 / (row.variance() + self.epsilon).sqrt();
 
         *row -= &DVector::from_element(n, mean);
 
@@ -215,7 +213,7 @@ impl Norm {
 
 The encoder is a stack of $N$ identical layers applied one after another. Each layer is a fixed pattern:
 
-- First a _multi-head self-attention_ block that computes how every position attend to every position
+- First a _multi-head self-attention_ block that computes how every position attends to every position
 - Then, a _position-wise feed-forward network (FFN)_ that further refines each position’s vector on its own: it takes the representation that attention has already contextualized and processes it in place, enriching what that slot encodes without pulling in information from other positions.
 
 Writing $X \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ for the layer input, one encoder layer (in the _post-norm_ style of [[Vas17]](https://arxiv.org/abs/1706.03762)) looks like
@@ -227,10 +225,9 @@ X'' &= \mathrm{LayerNorm}\bigl(X' + \mathrm{FFN}(X')\bigr)\,.
 \end{aligned}
 $$
 
-The fact that $X$ is added to the output of the attention block and $X'$ is added to the output of the FFN block is reffered to as _residual connections_ and represented by arrows that skip the Attention/FFN blocks.
+The fact that $X$ is added to the output of the attention block and $X'$ is added to the output of the FFN block is referred to as _residual connections_ and represented by arrows that skip the Attention/FFN blocks.
 
-![The encoder stack](/assets/vas17_encoder.png)
-_The encoder stack as given in [[Vas17]](https://arxiv.org/abs/1706.03762). The input is forwarded to a MultiHead attention block and a FFN block, and the output of these blocks are normalized with residual connections._
+{{< figure src="/assets/vas17_encoder.png" align="center" alt="The encoder stack" caption="The encoder stack as given in [Vas17](https://arxiv.org/abs/1706.03762). The input is forwarded to a multi-head attention block and an FFN block; each sublayer’s output is added to a residual and then normalized." >}}
 
 ### Multi-head attention
 
@@ -352,7 +349,7 @@ $$
 \mathrm{GeLU}(x) = 0.5 x (1 + \mathrm{erf}(x / \sqrt{2}))\,.
 $$
 
-($\mathrm{GeLU}$ is an approximation of the $\mathrm{ReLU}$ function used in [[Vas17]](https://arxiv.org/abs/1706.03762), that is more smooth and has a better gradient.)
+(The original Transformer FFN in [[Vas17]](https://arxiv.org/abs/1706.03762) uses $\mathrm{ReLU}$; models such as BERT and DistilBERT use $\mathrm{GeLU}$ instead. The formula above is the exact $\mathrm{GeLU}$ definition; the Rust snippet below uses the usual tanh-based approximation to it.)
 
 ```rust
 pub struct Ffn {
@@ -362,27 +359,109 @@ pub struct Ffn {
     pub bias_2: Vector,
 }
 
-pub fn forward(&self, x: DMatrix<f32>) -> Result<DMatrix<f32>, Error> {
-    let (_, n_cols) = x.shape();
-    if n_cols != self.linear_1.shape()[1] {
-        return Err(Error::InconsistentShape);
+impl Ffn {
+    pub fn forward(&self, x: DMatrix<f32>) -> Result<DMatrix<f32>, Error> {
+        let (_, n_cols) = x.shape();
+        if n_cols != self.linear_1.shape()[1] {
+            return Err(Error::InconsistentShape);
+        }
+
+        let mut y = x * self.linear_1.transpose();
+        add_bias_rows(&mut y, &self.bias_1);
+        apply_gelu(&mut y);
+
+        let mut z = y * self.linear_2.transpose();
+        add_bias_rows(&mut z, &self.bias_2);
+        Ok(z)
     }
-
-    let mut y = x * self.linear_1.transpose();
-    add_bias_rows(&mut y, &self.bias_1);
-    apply_gelu(&mut y);
-
-    let mut z = y * self.linear_2.transpose();
-    add_bias_rows(&mut z, &self.bias_2);
-    Ok(z)
 }
 
 fn apply_gelu(x: &mut DMatrix<f32>) {
-    // This is an approximation of the GeLU function that is more smooth and has a better gradient, that is used in BERT.
+    // This is an approximation of the GeLU function that is smoother and has a better gradient, as used in BERT.
     for x in x.iter_mut() {
         let u = std::f32::consts::FRAC_2_PI.sqrt() * (*x + 0.044715 * x.powi(3));
         *x = 0.5 * *x * (1.0 + u.tanh())
     }
 }
+```
 
+## Projecting the output to the vocabulary
+
+The output of the last layer of the encoder is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ that is then projected to the vocabulary space.
+
+$$
+\mathrm{Project}(X) = X W + b\,.
+$$
+
+Where $W$ and $b$ are learned weights and bias specific to the projection layer.
+
+The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times n_T}$ whose entries are the logits (a.k.a. unnormalized probabilities) for the next token.
+
+# Putting it all together
+
+We can now put all these pieces together to implement a function that evaluates the output of an encoder-only model such as BERT.
+
+In the next post, we will parse an actual model and make a program that runs it on user-written prompts.
+
+```rust
+pub struct DistilBert {
+    pub embeddings: Embeddings,
+    pub encoder: Vec<Stack>,
+    pub vocab_layer: VocabLayer,
+    pub d_model: usize,
+    pub seq_len: usize,
+    pub vocab_size: usize,
+    pub n_heads: usize,
+}
+
+pub struct Stack {
+    pub attention: Attention,
+    pub attention_norm: Norm,
+    pub ffn: Ffn,
+    pub output_norm: Norm,
+}
+
+pub struct VocabLayer {
+    pub norm: Norm,
+    pub transform: Matrix,
+    pub transform_bias: Vector,
+    pub project: Matrix,
+    pub project_bias: Vector,
+}
+
+impl DistilBert {
+
+    pub fn evaluate(&self, input: &[u32]) -> Result<DMatrix<f32>, Error> {
+        let mut output = self.embeddings.embed(input)?;
+        for stack in &self.encoder {
+            let residual = output.clone();
+            let attn_out = stack
+                .attention
+                .forward_multi_headed(output, self.n_heads)?;
+            let mut h = attn_out + residual;
+            stack.attention_norm.normalize_rows(&mut h)?;
+
+            let residual = h.clone();
+            let ffn_out = stack.ffn.forward(h)?;
+            let mut h = ffn_out + residual;
+            stack.output_norm.normalize_rows(&mut h)?;
+            output = h;
+        }
+
+        let mut h = linear(
+            &output,
+            &self.vocab_layer.transform,
+            &self.vocab_layer.transform_bias,
+        );
+        apply_gelu(&mut h);
+        self.vocab_layer.norm.normalize_rows(&mut h)?;
+        let logits = linear(
+            &h,
+            &self.vocab_layer.project,
+            &self.vocab_layer.project_bias,
+        );
+
+        Ok(logits)
+    }
+}
 ```
