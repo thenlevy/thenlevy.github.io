@@ -1,6 +1,6 @@
 ---
 date: "2026-04-07T20:47:29+02:00"
-draft: true
+draft: false
 title: "`llm_runner` Part I: Implementing an Encoder in Rust"
 description: "Understanding how LLMs work by implementing an encoder in Rust."
 ---
@@ -29,6 +29,12 @@ fn llm(tokens: &[Token]) -> Vec<f32> {
     // ...
 }
 ```
+
+{{< callout type="note" icon="🤔" >}}
+Because the LLM act on a sequence of tokens, the user's text input must be converted into a sequence of tokens before it can be passed to the model. This conversion is called _tokenization_.
+For that we will use the [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate. For now, we'll use it as a black box, and we may deep dive into how tokenization is implemented in a future post.
+
+{{< /callout >}}
 
 Given a sequence of tokens, an LLM can be used iteratively to generate the next token in the sequence, in a process called "Inference".
 
@@ -113,6 +119,15 @@ In practice, the sequence of tokens of length $\leq \mathrm{seq\_len}$ is repres
 
 The embedding is then computed as follows:
 Let $W_e \in \mathbb{R}^{n_T \times d_{\mathrm{model}}}$ be the learnt _token embedding_ matrix (row $j$ is the vector for token $j$) and let $P_e \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ be the matrix of _positional encodings_ for those positions (fixed or learnt), so that each row encodes where the token sits in the sequence.
+
+{{< callout type="note" icon="📍" title="Why positional encodings matter" >}}
+Token embeddings alone tell the model **which** symbols appear, but not **where** they appear. Attention compares pairs of positions using the same rules at every index, so without extra positional signal the representation would treat the sequence much like an unordered bag of tokens: reordering rows would not be distinguished in the way natural language requires.
+Adding $P_e$ addresses that by making the vector at each index depend on its position.
+
+In the implementation below, $P_e$ is a **learnt** matrix (one row per position), as in many modern systems. In the original Transformer [Vas17](https://arxiv.org/abs/1706.03762), each position $\mathrm{pos}$ and dimension was instead filled with sines and cosines at geometrically spaced wavelengths.
+
+$$P_e(\mathrm{pos}, 2i) = \sin\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right), \qquad P_e(\mathrm{pos}, 2i+1) = \cos\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right).$$
+{{< /callout >}}
 
 Then
 
@@ -400,7 +415,7 @@ impl Ffn {
 }
 ```
 
-## Projecting the output to the vocabulary
+## Projecting the Encoder's output to the vocabulary
 
 The output of the last layer of the encoder is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ that is then projected to the vocabulary space.
 
@@ -416,7 +431,8 @@ The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len}
 
 We can now put all these pieces together to implement a function that evaluates the output of an encoder-only model such as BERT.
 
-In the next post, we will parse an actual model and make a program that runs it on user-written prompts.
+Here is the final structure and evaluation function for the [DistilBERT](https://huggingface.co/docs/transformers/model_doc/distilbert) model:
+In the next post, we will parse an actual model to fill all the values in the structure and make a program that runs it on user-written prompts.
 
 `src/distilbert/structs.rs`:
 
