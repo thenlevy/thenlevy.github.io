@@ -1,0 +1,4 @@
+/* Widen main column (PaperMod default --main-width is 720px). */
+:root {
+    --main-width: 880px;
+}

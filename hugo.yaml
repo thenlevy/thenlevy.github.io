@@ -14,8 +14,26 @@ minify:
   disableXML: true
   minifyOutput: true
 
+markup:
+  goldmark:
+    extensions:
+      passthrough:
+        enable: true
+        delimiters:
+          block:
+            - - "\\["
+              - "\\]"
+            - - "$$"
+              - "$$"
+          inline:
+            - - "\\("
+              - "\\)"
+            - - "$"
+              - "$"
+
 params:
   env: production
+  math: true
   title: "My Blog"
   description: "A blog about the things I learn and build (mostly in Rust)."
   keywords: [Blog, Tech, Rust]

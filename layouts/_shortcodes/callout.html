@@ -1,0 +1,16 @@
+{{- $type := .Get "type" | default "default" -}}
+{{- $icon := .Get "icon" | default "💡" -}}
+{{- $title := .Get "title" | default "" -}}
+{{- $renderOpts := dict "display" "block" -}}
+{{- $body := .Page.RenderString $renderOpts .Inner -}}
+<aside class="callout callout--{{ $type }}{{ if eq $icon "none" }} callout--no-icon{{ end }}" role="note">
+  {{- if ne $icon "none" -}}
+  <span class="callout__icon" aria-hidden="true">{{ $icon }}</span>
+  {{- end -}}
+  <div class="callout__content">
+    {{- with $title -}}
+    <div class="callout__title">{{ . }}</div>
+    {{- end -}}
+    <div class="callout__body">{{ $body }}</div>
+  </div>
+</aside>
