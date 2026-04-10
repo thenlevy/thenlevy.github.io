@@ -1,13 +1,13 @@
 ---
 date: "2026-04-10T08:00:00+02:00"
 draft: false
-title: "`llm_runner` Part II: Loading Weights and Running DistilBERT"
-description: "Parsing Hugging Face checkpoints with safetensors, tokenizing text, and using masked language modeling to exercise our Rust encoder."
+title: "`llm_runner` Part II: Loading Weights and performing MLM inference"
+description: "Loading weights from the DistilBERT model and performing MLM inference in llm-runner."
 ---
 
-In [Part I]({{< relref "/posts/llm_runner_1" >}}), we implemented the DistilBERT architecture in Rust: embeddings, transformer blocks, and the vocabulary projection head. The tensors inside `DistilBert` were only *shapes* and *operations*; we still had to load real weights from a trained model and feed tokenized text into `evaluate`.
-
-This post explains how we do that in [`llm-runner`](https://github.com/thenlevy/llm-runner): where the checkpoint comes from, what the [Safetensors](https://huggingface.co/docs/safetensors/index) format provides, how the [`safetensors`](https://docs.rs/safetensors/latest/safetensors/) crate exposes it, and how we wire that into `DistilBert::try_from_bytes`. We then run the model in a small example using the [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate and masked language modeling (MLM) so we can see logits over the vocabulary for a user-chosen prompt.
+In [the previous post]({{< relref "/posts/llm_runner_1" >}}), we went through the mathematics and Rust implementation of an encoder architecture.
+Now, let's see how we can download a model and parse it into our `DistilBert` struct.
+Then, we will test our llm runner by performing masked language modeling (MLM) inference on a user-chosen prompt.
 
 # Getting the model from Hugging Face
 
@@ -20,34 +20,26 @@ cd distilbert-base-uncased
 git lfs pull
 ```
 
-If `model.safetensors` is only a few hundred bytes after clone, LFS objects were not fetched yet—`git lfs pull` (or recloning with LFS set up first) fixes that.
-
-For our code and tests we assume a directory next to the crate, e.g. `../distilbert-base-uncased/`, containing at least:
+When running the tests at the end of this post, we will assume a directory next to the crate, e.g. `../distilbert-base-uncased/`, containing at least:
 
 - `model.safetensors` — serialized weights
 - `tokenizer.json` — tokenizer in the format produced by Hugging Face’s `tokenizers` library (this is what `Tokenizer::from_file` loads)
 
-`config.json` documents hyperparameters (hidden size, number of layers, etc.); we mostly infer compatible dimensions from the tensors while parsing (for example, embedding layer norm gives us `d_model`).
+# Parsing the Safetensors model into the `DistilBert` struct
 
-# The Safetensors format
+[Safetensors](https://github.com/huggingface/safetensors) is an alternative to the format more commonly used in PyTorch.
+It consists of a small JSON header followed by a blob that consists of the raw bytes for the model's parameters. The JSON header maps each tensor name to object containing information about the offset at which the tensor's parameters are stored in the blob following the header.
+There are two resons for us to load the model from the `.safetensors` file instead of the `pytorch_model.bin` file:
 
-[Safetensors](https://huggingface.co/docs/safetensors/index) is a simple, mmap-friendly layout for storing a dictionary of named tensors: a small JSON header (tensor names, dtypes, shapes, and byte offsets) followed by the raw tensor bytes. It was designed as a safer alternative to unpickling arbitrary Python objects: you get typed arrays, not executable code.
+- Compared to PyTorch, the Safetensors format is "safe" in the sense that unpacking a PyTorch file is a process that can lead to arbitrary code execution, meaning that it requires some trust in the source.
+- Parsing is straightforawrd and there is pure Rust support for parsing the Safetensors format, using the [`safetensors`](https://docs.rs/safetensors/latest/safetensors/) crate.
 
-The specification and rationale live in the [official documentation](https://huggingface.co/docs/safetensors/index) and the [`safetensors` repository](https://github.com/huggingface/safetensors). Many models on the Hub are published in this format alongside or instead of PyTorch `.bin` checkpoints.
+The [`safetensors crate`](https://docs.rs/safetensors/latest/safetensors/) exposes the following interface:
 
-# The `safetensors` crate: `SafeTensors` and `TensorView`
+- `SafeTensors::deserialize(bytes: &[u8]) -> Result<Safetensors, Error>`
+- `Safetensors::tensor(name: &str) -> Result<TensorView, Error>` that returns a `TensorView` that borrows the underlying buffer: `shape()` gives dimensions (two for matrices, one for vectors), and `data()` is the raw bytes—here each four little-endian bytes are one `f32`.
 
-In Rust we depend on [`safetensors`](https://docs.rs/safetensors/latest/safetensors/) (see `Cargo.toml` in `llm-runner`). The typical entry point is:
-
-1. `SafeTensors::deserialize(bytes)` parses the file in memory and returns a `SafeTensors` handle.
-2. `tensor(name)` looks up a tensor by its full string key (as stored in the file, e.g. `distilbert.embeddings.word_embeddings.weight`) and returns a `TensorView<'_>` on success.
-
-A [`TensorView`](https://docs.rs/safetensors/latest/safetensors/tensor/struct.TensorView.html) is a zero-copy view into the original buffer:
-
-- `shape()` returns the dimensions (for matrices, two lengths; for vectors, one).
-- `data()` exposes raw bytes for the tensor’s elements; for `f32` we interpret each four-byte little-endian chunk as one float.
-
-The file’s header already recorded dtype and shape; `TensorView` is how we see that layout in Rust. The next step is to validate slices of that shape against what we have learned so far (for example, once `d_model` is known, we can require the second axis of `word_embeddings.weight` to match it while still reading the vocabulary size from the tensor’s first axis) and to copy into owned [`nalgebra`](https://docs.rs/nalgebra/latest/nalgebra/) types for `evaluate`. That is what `try_from_view` does: optional expected dimensions catch wrong keys early, and we require the payload length to match `rows * cols * 4` (or `len * 4` for a vector) so we never mis-read a truncated or wrongly typed blob.
+Our parsing will rely on this interface and the two helper functions below that load the parameters of a tensor into a `Matrix` or `Vector` struct.
 
 `src/layers/matrix.rs`:
 
@@ -88,9 +80,42 @@ impl Matrix {
 }
 ```
 
-At parse time we usually do not know `d_model`, `seq_len`, or `vocab_size` in advance: they are whatever the checkpoint stores. `Option<usize>` in `expected_shape` encodes that: `None` means “take this axis from the tensor in the file”; `Some(n)` means “it must equal a value we already inferred from an earlier tensor.” Later, attention and FFN blocks pass `d_model` into `try_from_views` so every weight lines up with that width.
+`src/layers/vector.rs`:
 
-Below, `src/distilbert/parse.rs` deserializes the file, declares `seq_len`, `d_model`, and `vocab_size` without initial values, then fills them while building the embedding submodule. The `path` stack mirrors Hugging Face’s dotted names (`distilbert.embeddings.LayerNorm.bias`, …); each `path.join(".")` is the tensor key inside the safetensors archive. After `LayerNorm`, we know `d_model`; position and word matrices use `[None, Some(d_model)]` so row counts become `seq_len` and `vocab_size`. The block ends with an `Embeddings { norm, positions, words }` value ready for `DistilBert`.
+```rust
+impl Vector {
+    pub fn try_from_view(
+        view: TensorView<'_>,
+        expected_length: Option<usize>,
+    ) -> Result<Self, Error> {
+        let [len] = view.shape() else {
+            return Err(Error::InconsistentShape);
+        };
+
+        if expected_length.is_some_and(|l| l != *len) {
+            return Err(Error::InconsistentShape);
+        }
+
+        if view.data().len() != len * 4 {
+            return Err(Error::InvalidData);
+        }
+
+        Ok(Self {
+            inner: DVector::from_iterator(
+                *len,
+                view.data()
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+            ),
+        })
+    }
+
+    // ...
+}
+```
+
+The parsing walks along the tensor names, recovers their parameters from the `SafeTensors` handle and loads them into the fields of the `DistilBert` struct.
+Here is an extract of the parsing, showing how we parse the embedding layer.
 
 `src/distilbert/parse.rs` (from `SafeTensors::deserialize` through the embedding struct):
 
@@ -144,103 +169,37 @@ Below, `src/distilbert/parse.rs` deserializes the file, declares `seq_len`, `d_m
         }
 ```
 
-The MLM head does the same for the inner dimension of `vocab_transform`: infer `d_logit` from the weight matrix, then fix the bias length.
+{{< callout type="note" icon="🤔" title="Vocab projector weights" >}}
+
+When implementing the parsing, I thought the parameters of the vocab projector were missing from the safetensors file, so I've downloaded them in [Numpy format](https://numpy.org/doc/2.1/reference/generated/numpy.lib.format.html#format-version-1-0) from the pytorch model file using [Netron.app](https://netron.app/) and implemented parsing from this format
 
 ```rust
-        let vocab_transform_weight =
-            Matrix::try_from_view(vocab_transform_weight_view, [None, Some(d_model)])?;
-        let d_logit = vocab_transform_weight.shape()[0];
-        let vocab_transform_bias_view = safe_tensors.tensor("vocab_transform.bias")?;
-        let vocab_transform_bias = Vector::try_from_view(vocab_transform_bias_view, Some(d_logit))?;
+        let vocab_project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../distilbert-base-uncased/vocab_projector_weight.npy");
+        let vocab_project_bytes = std::fs::read(vocab_project_path)?;
+        let header_size =
+            u16::from_le_bytes([vocab_project_bytes[8], vocab_project_bytes[9]]) as usize;
+
+        let header_end = 10 + header_size;
+
+        let vocab_project_weight = Matrix::try_from_bytes(
+            vocab_project_bytes[header_end..(header_end + d_logit * vocab_size * 4)].as_ref(),
+            [vocab_size, d_logit],
+        )?;
 ```
 
-`src/layers/vector.rs`:
+Later on, I learned that for the `distilbert-base-uncased` model, the parameters of the vocab projector are actually not made explicit in the safetensors file, but are instead the same as the one used in the embedding layer.
 
-```rust
-impl Vector {
-    pub fn try_from_view(
-        view: TensorView<'_>,
-        expected_length: Option<usize>,
-    ) -> Result<Self, Error> {
-        let [len] = view.shape() else {
-            return Err(Error::InconsistentShape);
-        };
-
-        if expected_length.is_some_and(|l| l != *len) {
-            return Err(Error::InconsistentShape);
-        }
-
-        if view.data().len() != len * 4 {
-            return Err(Error::InvalidData);
-        }
-
-        Ok(Self {
-            inner: DVector::from_iterator(
-                *len,
-                view.data()
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
-            ),
-        })
-    }
-
-    // ...
-}
-```
-
-`Norm::try_from_views` in `src/layers/norm.rs` composes two such views (bias and weight) with matching length. Together, these are the bridge from Safetensors’ flat, named tensors to the typed matrices and vectors used in Part I.
-
-# Parsing into `DistilBert`
-
-Implementation lives in `src/distilbert/parse.rs`: `DistilBert::try_from_bytes` deserializes with `SafeTensors::deserialize`, then walks the Hugging Face / PyTorch parameter names for DistilBERT.
-
-Rough structure:
-
-1. `distilbert.embeddings` — layer norm (`LayerNorm.weight` / `bias`), `position_embeddings.weight`, `word_embeddings.weight` → our `Embeddings`. From the embedding norm we recover `d_model`, from position embeddings `seq_len`, from word embeddings `vocab_size`.
-2. `distilbert.transformer.layer.{i}` — for each index `i` until `q_lin.weight` is missing, load attention (`q_lin`, `k_lin`, `v_lin`, `out_lin`), FFN (`ffn.lin1` / `lin2`), `sa_layer_norm`, and `output_layer_norm` → one `Stack` per layer.
-3. Head for masked LM — keys at the top level of the state dict, e.g. `vocab_transform.weight`, `vocab_transform.bias`, `vocab_layer_norm`, `vocab_projector.bias`, assembled into our `VocabLayer`.
-
-We build dot-separated names with a small path stack (e.g. `path.join(".")`) so the code mirrors the nested naming convention used on the Hub.
-
-{{< callout type="note" icon="⚠️" title="Vocab projector weights" >}}
-In the checkpoint used while developing `llm-runner`, the large `vocab_projector.weight` tensor was not present in `model.safetensors`. DistilBERT’s LM head can be tied to the input word embeddings in full implementations; depending on export tooling, that matrix may be omitted or stored elsewhere. Our parser currently loads that matrix from a separate `vocab_projector_weight.npy` file next to the model directory (bytes parsed after the NumPy header). If your `.safetensors` file includes `vocab_projector.weight`, you would map it the same way as the other matrices and drop the sidecar. The important idea for this post is that every slot in `DistilBert` must be filled from some consistent source matching the training checkpoint.
 {{< /callout >}}
-
-The constructor ends with something like:
-
-```rust
-Ok(Self {
-    embeddings: embedding,
-    encoder: transformers,
-    d_model,
-    seq_len,
-    vocab_size,
-    vocab_layer,
-    n_heads: 12,
-})
-```
-
-where `n_heads` matches `distilbert-base-uncased` (12 heads, `d_model = 768`). A unit test in `src/lib.rs` asserts `d_model`, `seq_len`, `vocab_size`, and layer count after parsing.
 
 # Running the model on user input
 
-DistilBERT as released on the Hub is not a causal language model: it does not produce a distribution over the *next* token given all previous tokens in an autoregressive loop. It is trained as an encoder with an MLM head: for each position, the network can output logits over the whole vocabulary, usually after seeing the full sequence (with some positions masked during training).
+The DistilBERT model that we've parsed here is an ecoder only model: it does not have a decoder stack so it does not produce a distribution over the _next_ token of a sequence.
+Instead, it is trained to perform masked language modeling (MLM), that is to say to predict tokens that should replace occurences of a special `[MASK]` token in a sequence.
 
-So we do not implement “keep appending tokens” inference here; we mimic a useful form of inference by filling a `[MASK]` slot.
+For this reason we will do not use it for a “keep appending tokens” inference here; we mimic a form of inference by filling a `[MASK]` slot.
 
-## Tokenization with `tokenizers`
-
-The [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate loads the same artifact Hugging Face ships with the model:
-
-```rust
-let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-```
-
-`tokenizer.json` encodes the WordPiece (or other) model, special tokens, and normalization—no need to reimplement subword splitting in Rust.
-
-For BERT-style models, a single sequence is encoded with special tokens `[CLS]` … `[SEP]`. In our example we call `encode(text, true)` so those tokens are added automatically. The result exposes token ids as `u32` values compatible with `DistilBert::evaluate`.
-
-## MLM: one masked position, one row of logits
+Before feeding it to the model, we need to tokenize the input text. For that we will use the [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate, that we configure with the `tokenizer.json` file that comes with the model.
 
 The example binary `examples/mlm_complete.rs` does the following:
 

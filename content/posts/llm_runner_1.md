@@ -169,7 +169,9 @@ impl Embeddings {
                 return Err(Error::InconsistentShape);
             }
 
-            embeddings.row_mut(i).copy_from(&(self.words.row(t_id) + self.positions.row(i)));
+            embeddings
+                .row_mut(i)
+                .copy_from(&(self.words.row(t_id) + self.positions.row(i)));
         }
 
         self.norm.normalize_rows(&mut embeddings)?;
