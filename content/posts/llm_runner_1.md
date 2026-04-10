@@ -12,7 +12,7 @@ To start this project, it was natural to start with the architecture described i
 
 In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
 
-In the next post, we'll see how we parse an actual model and make a program that runs it on user-written prompts.
+In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual checkpoint and run it on user-written prompts (via MLM and `[MASK]`).
 
 # What is a LLM?
 
@@ -432,7 +432,7 @@ The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len}
 We can now put all these pieces together to implement a function that evaluates the output of an encoder-only model such as BERT.
 
 Here is the final structure and evaluation function for the [DistilBERT](https://huggingface.co/docs/transformers/model_doc/distilbert) model:
-In the next post, we will parse an actual model to fill all the values in the structure and make a program that runs it on user-written prompts.
+In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual model to fill the structure and run it on user-written prompts.
 
 `src/distilbert/structs.rs`:
 
