@@ -28,11 +28,11 @@ When running the tests at the end of this post, we will assume a directory next 
 # Parsing the Safetensors model into the `DistilBert` struct
 
 [Safetensors](https://github.com/huggingface/safetensors) is an alternative to the format more commonly used in PyTorch.
-It consists of a small JSON header followed by a blob that consists of the raw bytes for the model's parameters. The JSON header maps each tensor name to object containing information about the offset at which the tensor's parameters are stored in the blob following the header.
-There are two resons for us to load the model from the `.safetensors` file instead of the `pytorch_model.bin` file:
+It consists of a small JSON header followed by a blob that consists of the raw bytes for the model's parameters. The JSON header maps each tensor name to an object containing information about the offset at which the tensor's parameters are stored in the blob following the header.
+There are two reasons for us to load the model from the `.safetensors` file instead of the `pytorch_model.bin` file:
 
 - Compared to PyTorch, the Safetensors format is "safe" in the sense that unpacking a PyTorch file is a process that can lead to arbitrary code execution, meaning that it requires some trust in the source.
-- Parsing is straightforawrd and there is pure Rust support for parsing the Safetensors format, using the [`safetensors`](https://docs.rs/safetensors/latest/safetensors/) crate.
+- Parsing is straightforward and there is pure Rust support for parsing the Safetensors format, using the [`safetensors`](https://docs.rs/safetensors/latest/safetensors/) crate.
 
 The [`safetensors crate`](https://docs.rs/safetensors/latest/safetensors/) exposes the following interface:
 
@@ -171,7 +171,7 @@ Here is an extract of the parsing, showing how we parse the embedding layer.
 
 {{< callout type="note" icon="🤔" title="Vocab projector weights" >}}
 
-When implementing the parsing, I thought the parameters of the vocab projector were missing from the safetensors file, so I've downloaded them in [Numpy format](https://numpy.org/doc/2.1/reference/generated/numpy.lib.format.html#format-version-1-0) from the pytorch model file using [Netron.app](https://netron.app/) and implemented parsing from this format
+When implementing the parsing, I thought the parameters of the vocab projector were missing from the safetensors file, so I've downloaded them in [NumPy format](https://numpy.org/doc/2.1/reference/generated/numpy.lib.format.html#format-version-1-0) from the pytorch model file using [Netron.app](https://netron.app/) and implemented parsing from this format
 
 ```rust
         let vocab_project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -188,20 +188,20 @@ When implementing the parsing, I thought the parameters of the vocab projector w
         )?;
 ```
 
-Later on, I learned that for the `distilbert-base-uncased` model, the parameters of the vocab projector are actually not made explicit in the safetensors file, but are instead the same as the one used in the embedding layer.
+Later on, I learned that for the `distilbert-base-uncased` model, the parameters of the vocab projector are actually not made explicit in the safetensors file, but are instead the same as those used in the embedding layer.
 
 {{< /callout >}}
 
 # Running the model on user input
 
-The DistilBERT model that we've parsed here is an ecoder only model: it does not have a decoder stack so it does not produce a distribution over the _next_ token of a sequence.
-Instead, it is trained to perform masked language modeling (MLM), that is to say to predict tokens that should replace occurences of a special `[MASK]` token in a sequence.
+The DistilBERT model that we've parsed here is an encoder-only model: it does not have a decoder stack so it does not produce a distribution over the _next_ token of a sequence.
+Instead, it is trained to perform masked language modeling (MLM), that is to say to predict tokens that should replace occurrences of a special `[MASK]` token in a sequence.
 
-For this reason we will do not use it for a “keep appending tokens” inference here; we mimic a form of inference by filling a `[MASK]` slot.
+For this reason we do not use it for a “keep appending tokens” inference here; we mimic a form of inference by filling a `[MASK]` slot.
 
 Before feeding it to the model, we need to tokenize the input text. For that we will use the [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate, that we configure with the `tokenizer.json` file that comes with the model.
 
-The example binary `examples/mlm_complete.rs` does the following:
+We write a program that does the following:
 
 1. Take a user prompt from the command line (or a default string).
 2. Append `[MASK].` so there is a definite masked token to predict.
@@ -211,16 +211,131 @@ The example binary `examples/mlm_complete.rs` does the following:
 6. Call `distilbert.evaluate(&input_ids)`, which returns a matrix of shape `(seq_len, vocab_size)` — the same projection head described in Part I, applied after the encoder and the DistilBERT MLM bottleneck.
 7. Take `logits.row(mask_pos)`: a length-`vocab_size` vector of scores. Sort by logit and print the top-$k$ token ids and string pieces (via `id_to_token`).
 
-So for prompt “The capital of France is” we might append `[MASK].` and inspect which tokens the model scores highest at the mask position—roughly “what word belongs here?” rather than “what is the next token in a continuation?”.
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let model_dir = root.join("../distilbert-base-uncased");
+    let model_path = model_dir.join("model.safetensors");
+    let tokenizer_path = model_dir.join("tokenizer.json");
 
-{{< callout type="note" icon="🤔" title="Why this is still instructive" >}}
-It exercises the full path: tokenizer → ids → embeddings → transformer stack → MLM head → argmax or ranking over the vocabulary. That is the same numerical pipeline that powers masked pre-training, and it validates that our parsed weights and forward pass match the architecture we built in Part I.
-{{< /callout >}}
+    let user_prompt: String = std::env::args()
+        .skip(1)
+        .fold(String::new(), |acc, arg| acc + " " + arg.as_str());
 
-# Summary
+    if user_prompt.is_empty() {
+        return Err("No prompt provided".into());
+    }
 
-- We clone [`distilbert-base-uncased`](https://huggingface.co/distilbert-base-uncased) with Git (and Git LFS) and point the project at `model.safetensors` and `tokenizer.json`.
-- Safetensors stores named tensors in a documented, safe binary format; the `safetensors` crate gives `SafeTensors::deserialize` and `TensorView` (`shape`, raw `data`), which `Matrix::try_from_view` and `Vector::try_from_view` turn into owned `f32` data for `Matrix`, `Vector`, `Norm`, and then `DistilBert`.
-- The `tokenizers` crate loads `tokenizer.json`; we encode text with special tokens, then run `evaluate` and read MLM logits at the `[MASK]` position to simulate a concrete “inference” story for an encoder-only checkpoint.
+    let text = format!("{user_prompt} [MASK].");
 
-Next steps—if we continue the series—might include causal decoders, sampling, or digging into how the tokenizer is built. For now, the runnable path is `cargo run --example mlm_complete -- "your words here"` with the cloned model directory in place, as sketched above.
+    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())?;
+    let mask_id = tokenizer
+        .token_to_id("[MASK]")
+        .ok_or("tokenizer has no [MASK] token")? as u32;
+
+    // Here, the tokenizer will add the special tokens `[CLS]` and `[SEP]` at the beginning and end
+    // of the text. These tokens indicate the beginning and end of the sequence to process to the
+    // DistilBERT model.
+    let encoding = tokenizer
+        .encode(text.as_str(), true)
+        .map_err(|e| e.to_string())?;
+    let input_ids: Vec<u32> = encoding.get_ids().iter().map(|&id| id as u32).collect();
+
+    let mask_pos = input_ids
+        .iter()
+        .position(|&id| id == mask_id)
+        .ok_or("no [MASK] in tokenized input (check spelling / tokenizer)")?;
+
+    let model_bytes = std::fs::read(model_path)?;
+    let distilbert = DistilBert::try_from_bytes(&model_bytes).map_err(|e| format!("{e:?}"))?;
+
+    if input_ids.len() > distilbert.seq_len {
+        return Err(format!(
+            "sequence length {} exceeds model max {}",
+            input_ids.len(),
+            distilbert.seq_len
+        )
+        .into());
+    }
+
+    let logits = distilbert
+        .evaluate(&input_ids)
+        .map_err(|e| format!("{e:?}"))?;
+    let row = logits.row(mask_pos);
+
+    let mut scored: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("Prompt + mask: {text}");
+    println!("Token IDs: {input_ids:?}");
+    println!("MLM at position {mask_pos} — top predictions:");
+    const TOP: usize = 5;
+    for (rank, (tid, logit)) in scored.iter().take(TOP).enumerate() {
+        let piece = tokenizer
+            .id_to_token(*tid as u32)
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "  {}. id={} logit={:.3} token={piece:?}",
+            rank + 1,
+            tid,
+            logit
+        );
+    }
+
+    Ok(())
+}
+```
+
+# Results and next steps
+
+Here are some examples of the results we get when running the program with different prompts.
+
+```
+sh-5.3$ cargo run --release --example mlm_complete -- "The biggest planet in the solar system is"
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/examples/mlm_complete 'The biggest planet in the solar system is'`
+Prompt + mask:  The biggest planet in the solar system is [MASK].
+Token IDs: [101, 1996, 5221, 4774, 1999, 1996, 5943, 2291, 2003, 103, 1012, 102]
+MLM at position 9 — top predictions:
+  1. id=13035 logit=12.284 token="jupiter"
+  2. id=11691 logit=12.256 token="venus"
+  3. id=26930 logit=11.775 token="pluto"
+  4. id=21167 logit=11.517 token="neptune"
+  5. id=7733 logit=11.503 token="mars"
+```
+
+```
+sh-5.3$ cargo run --release --example mlm_complete -- "The capital of France is"
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/examples/mlm_complete 'The capital of France is'`
+Prompt + mask:  The capital of France is [MASK].
+Token IDs: [101, 1996, 3007, 1997, 2605, 2003, 103, 1012, 102]
+MLM at position 6 — top predictions:
+  1. id=16766 logit=12.166 token="marseille"
+  2. id=25387 logit=11.711 token="nantes"
+  3. id=17209 logit=11.684 token="toulouse"
+  4. id=3000 logit=11.662 token="paris"
+  5. id=10241 logit=11.551 token="lyon"
+```
+
+```
+sh-5.3$ cargo run --release --example mlm_complete -- "The fastest animal on earth is the"
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/examples/mlm_complete 'The fastest animal on earth is the'`
+Prompt + mask:  The fastest animal on earth is the [MASK].
+Token IDs: [101, 1996, 7915, 4111, 2006, 3011, 2003, 1996, 103, 1012, 102]
+MLM at position 8 — top predictions:
+  1. id=16490 logit=10.568 token="jaguar"
+  2. id=10777 logit=9.546 token="elephant"
+  3. id=7006 logit=8.891 token="lion"
+  4. id=15450 logit=8.827 token="lizard"
+  5. id=4419 logit=8.813 token="fox"
+```
+
+While these results are not perfect, we can at least see that the model is capable of generating a "reasonable" prediction for the masked token.
+Considering the fact that these results are obtained with a small (64M parameters) model that can run on a laptop, I think this is rather encouraging, and it seems to indicate that the implementation is correct.
+
+Here are things that I would like to explore in future posts:
+
+- Running a decoder such as GPT to perform text generation
+- Looking at how the tokenizer is implemented
