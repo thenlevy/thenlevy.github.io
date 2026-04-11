@@ -6,7 +6,8 @@ description: "Parsing and evaluating GPT-2 weights and running causal self-atten
 ---
 
 In [Part I]({{< relref "/posts/llm_runner_1" >}}) we implemented a Transformer encoder in Rust; in [Part II]({{< relref "/posts/llm_runner_2" >}}) we loaded DistilBERT and ran masked language modeling. This post describes the next step in [`llm-runner`](https://github.com/thenlevy/llm-runner): parsing **GPT-2** weights (targeting [`gpt2-medium`](https://huggingface.co/gpt2-medium)), evaluating the model with causal self-attention, and testing the pipeline.
-This post accompanies the [PR #2 on the `llm-runner` repository](https://github.com/thenlevy/llm-runner/pull/2).
+
+This post accompanies [PR #2 on the `llm-runner` repository](https://github.com/thenlevy/llm-runner/pull/2).
 
 # Adjustments to the Rust structures for GPT
 
@@ -137,15 +138,15 @@ So in order to parse GPT-2 weights, we need to implement dedicated constructors 
 
 ## Masked (causal) self-attention
 
-One of the key differences between the encoder and the decoder stack in the Transformer architecture as described in [[Vas17]](https://arxiv.org/abs/1706.03762) is how they use the self attention mechanism.
+One of the key differences between the encoder and decoder stacks in the Transformer architecture as described in [[Vas17]](https://arxiv.org/abs/1706.03762) is how they use self-attention.
 
 - In the encoder stack, the attention is **bidirectional**: each position attends to all other positions in the sequence.
 - In the decoder stack, the attention is **causal**: each position attends only to previous positions in the sequence.
 
 This is because the two stacks play different roles in the model:
 
-- The encoder stack must encode a full understanding of the input sequence, and therefore need to consider the context of all tokens in the sequence at once.
-- The decoder stack is used to generate the output sequence one token at a time, therefore it must not be able to attend position that correspond to non-generated tokens. This is especially important during training when the model is given a whole sequence at once and must be able to "not cheat" be looking at the position that it must predict.
+- The encoder stack must encode a full understanding of the input sequence, and therefore needs to consider the context of all tokens at once.
+- The decoder stack generates the output sequence one token at a time, so it must not attend to positions that correspond to non-generated tokens. This matters especially during training, when the model sees the full sequence and must not "cheat" by looking ahead at the token it is supposed to predict.
 
 Causal attention is implemented by adding an **upper-triangular** block of $-\infty$ to attention scores before applying the row-wise softmax, so position $i$ only attends to $j \le i$.
 
@@ -209,7 +210,7 @@ Causal attention is implemented by adding an **upper-triangular** block of $-\in
 
 ## Evaluating the GPT-2 model
 
-GPT-2 is a decoder-only model, that simply forwards its input through several layers of attention layers and immediately projects the output to the vocabulary space to outputs the logits for the next token.
+GPT-2 is a decoder-only model: it forwards its input through several transformer blocks (each with attention and an FFN) and finally projects the last hidden state to vocabulary size to produce logits for the next token.
 
 ```rust
 impl Gpt2 {
@@ -238,10 +239,10 @@ impl Gpt2 {
 
 # Parsing and testing
 
-Parsing reuses the same startegy that we used in [Part II]({{< relref "/posts/llm_runner_2" >}}): We use `SafeTensors::deserialize` to load the weights from the checkpoint, and then we parse the weights into the `Gpt2` structure.
+Parsing reuses the same strategy as in [Part II]({{< relref "/posts/llm_runner_2" >}}): we call `SafeTensors::deserialize` to load the checkpoint, then map tensors into the `Gpt2` structure.
 
-We then add to the examples a program that loads the model and performs causal self-attention inference on a user-provided input sequence.
-As we did in [Part II]({{< relref "/posts/llm_runner_2" >}}), we use the `[tokenizers](https://docs.rs/tokenizers/latest/tokenizers/)` crate to tokenize the input sequence and then call the `evaluate` function to get the logits for the next token. By performing this inference step repeatedly, we generate one by one a sequence of tokens that continue the input sequence.
+We add an example binary that loads the model and runs causal LM inference on a user-provided prompt.
+As in [Part II]({{< relref "/posts/llm_runner_2" >}}), we use the [`tokenizers`](https://docs.rs/tokenizers/latest/tokenizers/) crate to tokenize the prompt, then call `evaluate` to obtain logits for the next token. Repeating that step extends the sequence token by token.
 
 ```rust
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
@@ -278,8 +279,8 @@ As we did in [Part II]({{< relref "/posts/llm_runner_2" >}}), we use the `[token
     }
 ```
 
-Here are some examples of results that we get when running the program with different prompts.
-The seed is given either as input or displayed before starting generation so that the runs can be reproduced.
+Below are sample runs with different prompts.
+The seed is passed in or printed before generation so runs stay reproducible.
 
 ```
 ±SEED=42 cargo run --release --example gpt2_complete -- "Hello, I am a software engineer"
@@ -296,4 +297,4 @@ seed: 7715690566371802064
 We are going on vacation to the beach, yes I know climate change is not in the news right now, but I am getting older so this is where we are headed! We must
 ```
 
-On my laptop, the program took 57s to generate 32 tokens. Increasing evaluation speed may be an interesting subject for future posts. I will also be interested in digging more in the tokenization process to see if we can implement it ourselves.
+On my laptop, the program took about 57 seconds to generate 32 tokens. Speeding up evaluation could be a good topic for a later post. I am also curious to dig deeper into tokenization and eventually implement it ourselves.
