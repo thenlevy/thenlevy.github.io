@@ -239,7 +239,7 @@ impl Gpt2 {
 
 # Parsing and testing
 
-Parsing reuses the same strategy as in [Part II]({{< relref "/posts/llm_runner_2" >}}): we call `SafeTensors::deserialize` to load the checkpoint, then map tensors into the `Gpt2` structure.
+Parsing reuses the same strategy as in [Part II]({{< relref "/posts/llm_runner_2" >}}): we call `SafeTensors::deserialize` to load the model, then map tensors into the `Gpt2` structure.
 
 We add an example binary that loads the model and runs causal LM inference on a user-provided prompt.
 As in [Part II]({{< relref "/posts/llm_runner_2" >}}), we use the [`tokenizers`](https://docs.rs/tokenizers/latest/tokenizers/) crate to tokenize the prompt, then call `evaluate` to obtain logits for the next token. Repeating that step extends the sequence token by token.

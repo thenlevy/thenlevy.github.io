@@ -12,7 +12,7 @@ To start this project, it was natural to start with the architecture described i
 
 In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
 
-In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual checkpoint and run it on user-written prompts (via MLM and `[MASK]`). In [Part III]({{< relref "/posts/llm_runner_3" >}}), we parse GPT-2 and run causal (decoder) inference; that work is in [PR #2](https://github.com/thenlevy/llm-runner/pull/2).
+In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual model and run it on user-written prompts (via MLM and `[MASK]`). In [Part III]({{< relref "/posts/llm_runner_3" >}}), we parse GPT-2 and run causal (decoder) inference; that work is in [PR #2](https://github.com/thenlevy/llm-runner/pull/2).
 
 # What is a LLM?
 
