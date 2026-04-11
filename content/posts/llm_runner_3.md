@@ -297,4 +297,7 @@ seed: 7715690566371802064
 We are going on vacation to the beach, yes I know climate change is not in the news right now, but I am getting older so this is where we are headed! We must
 ```
 
+The continuations are only **32 new tokens**, so lines end mid-sentence (`Please don`, `We must`). Still, they show that the full path is working: tokenization, forward passes, and decoding back to text.
+The output's quality is not perfect, grammar mistake and even incoherent word/sentences appear, but still, the output gives a vague impression of pseudo-coherence.
+
 On my laptop, the program took about 57 seconds to generate 32 tokens. Speeding up evaluation could be a good topic for a later post. I am also curious to dig deeper into tokenization and eventually implement it ourselves.
