@@ -12,7 +12,7 @@ To start this project, it was natural to start with the architecture described i
 
 In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
 
-In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual checkpoint and run it on user-written prompts (via MLM and `[MASK]`).
+In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual checkpoint and run it on user-written prompts (via MLM and `[MASK]`). In [Part III]({{< relref "/posts/llm_runner_3" >}}), we parse GPT-2 and run causal (decoder) inference; that work is in [PR #2](https://github.com/thenlevy/llm-runner/pull/2).
 
 # What is a LLM?
 
@@ -415,17 +415,23 @@ impl Ffn {
 }
 ```
 
-## Projecting the Encoder's output to the vocabulary
+## MLM Implementation and Projection of the output to the vocabulary
 
-The output of the last layer of the encoder is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ that is then projected to the vocabulary space.
+In this Part and in [Part II]({{< relref "/posts/llm_runner_2" >}}), we focus on an implementation of the DistilBERT model, which is an encoder-only model that is trained to perform masked language modeling (MLM).
+
+The output of the last layer of the encoder is a matrix $X \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$. The masked-LM head first applies a learned linear transform in that same dimension, then $\mathrm{GeLU}$, then row-wise $\mathrm{LayerNorm}$, and only then maps to the vocabulary:
 
 $$
-\mathrm{Project}(X) = X W + b\,.
+H = \mathrm{LayerNorm}\bigl(\mathrm{GeLU}(X W_t + b_t)\bigr)\,.
 $$
 
-Where $W$ and $b$ are learned weights and bias specific to the projection layer.
+$$
+\mathrm{Project}(H) = H W + b\,.
+$$
 
-The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times n_T}$ whose entries are the logits (a.k.a. unnormalized probabilities) for the next token.
+Where $W_t$ and $b_t$ are the transform weights and bias, and $W$ and $b$ are learned weights and bias for the projection to the vocabulary.
+
+The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len} \times n_T}$ whose entries are the logits (a.k.a. unnormalized probabilities) for each token position. The goal of the masked-LM head is to predict the token that should replace the `[MASK]` token in the input sequence.
 
 # Putting it all together
 
