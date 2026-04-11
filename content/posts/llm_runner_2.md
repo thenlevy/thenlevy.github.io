@@ -337,5 +337,5 @@ Considering the fact that these results are obtained with a small (64M parameter
 
 Here are things that I would like to explore in future posts:
 
-- Running a decoder such as GPT to perform text generation
+- [Part III]({{< relref "/posts/llm_runner_3" >}}) covers parsing GPT-2 and text generation with a decoder ([PR #2](https://github.com/thenlevy/llm-runner/pull/2)).
 - Looking at how the tokenizer is implemented
