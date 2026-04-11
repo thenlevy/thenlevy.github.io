@@ -296,4 +296,4 @@ seed: 7715690566371802064
 We are going on vacation to the beach, yes I know climate change is not in the news right now, but I am getting older so this is where we are headed! We must
 ```
 
-On my laptop, the program took 57s to generate 32 tokens.
+On my laptop, the program took 57s to generate 32 tokens. Increasing evaluation speed may be an interesting subject for future posts. I will also be interested in digging more in the tokenization process to see if we can implement it ourselves.
