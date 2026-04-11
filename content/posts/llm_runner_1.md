@@ -435,8 +435,6 @@ The output of the projection layer is a matrix in $\mathbb{R}^{\mathrm{seq\_len}
 
 # Putting it all together
 
-We can now put all these pieces together to implement a function that evaluates the output of an encoder-only model such as BERT.
-
 Here is the final structure and evaluation function for the [DistilBERT](https://huggingface.co/docs/transformers/model_doc/distilbert) model:
 In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual model to fill the structure and run it on user-written prompts.
 
