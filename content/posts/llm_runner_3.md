@@ -150,6 +150,23 @@ This is because the two stacks play different roles in the model:
 
 Causal attention is implemented by adding an **upper-triangular** block of $-\infty$ to attention scores before applying the row-wise softmax, so position $i$ only attends to $j \le i$.
 
+$$
+\mathrm{MaskedAttn}(Q, K, V) = \mathrm{softmax}\left(\frac{Q K^T}{\sqrt{d_k}} + M\right) V
+$$
+
+where:
+
+- $Q, K, V$ are the query, key, and value matrices,
+- $d_k$ is the dimensionality of the key (and query) vectors,
+- $M$ is a mask matrix that assigns $0$ to allowed positions and $-\infty$ (or a very large negative number) to masked-out (future) positions, i.e.
+  $$
+  M_{ij} =
+  \begin{cases}
+    0 & \text{if } j \leq i \\
+    -\infty & \text{if } j > i
+  \end{cases}
+  $$
+
 ```rust
     /// Equivalent to [forward_multi_head_masked] with a causal (upper triangular of -∞) mask.
     pub fn forward_multi_head_causal(
