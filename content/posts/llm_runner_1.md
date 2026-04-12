@@ -16,7 +16,7 @@ In [Part II]({{< relref "/posts/llm_runner_2" >}}), we will parse an actual _che
 
 In [Part III]({{< relref "/posts/llm_runner_3" >}}), we will parse GPT-2 [[Radford et al., 2019]](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and run causal (decoder) inference;
 
-{{< callout type="note" icon="🏋️" title="A word about traingin" >}}
+{{< callout type="note" icon="🏋️" title="A word about training" >}}
 
 As we will see, LLMs can be seen as composition of many parametrized functions. The value of these parameters called _weights_ are automatically adjusted during a process called _training_. These parameters intervene as matrices coefficients in linear operations that are performed in these functions.
 
