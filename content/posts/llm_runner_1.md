@@ -8,15 +8,27 @@ description: "Understanding how LLMs work by implementing an encoder in Rust."
 Recently, I've started a journey to "understand how LLMs work".
 Implementing something is a good way to understand it, so I've started the [`llm-runner`](https://github.com/thenlevy/llm-runner) project.
 
-To start this project, it was natural to start with the architecture described in the fundamental paper _Attention is all you need_ [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762).
+To start this project, it was natural to start with the architecture described in the fundamental paper _Attention is all you need_ [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762). [[Vas17]](https://arxiv.org/abs/1706.03762) was not using the transformer architecture in an LLM yet, but it was the first to introduce the attention mechanism and the transformer architecture.
 
-In this post, we will focus on the general mathematical operations performed by LLMs, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
+In this post, we will focus on the general mathematical operations performed in the transformer architecture, and their implementation in Rust. This post and the next one accompany the first [PR](https://github.com/thenlevy/llm-runner/pull/1) on the `llm-runner` repository.
 
-In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual model and run it on user-written prompts (via MLM and `[MASK]`). In [Part III]({{< relref "/posts/llm_runner_3" >}}), we parse GPT-2 and run causal (decoder) inference; that work is in [PR #2](https://github.com/thenlevy/llm-runner/pull/2).
+In [Part II]({{< relref "/posts/llm_runner_2" >}}), we will parse an actual _checkpoint_ (i.e. a file containing the weights of a model) for the BERT model [[Devlin et al., 2018]](https://arxiv.org/abs/1810.04805) and run it to perform masked language modeling (MLM) on user-provided prompts.
+
+In [Part III]({{< relref "/posts/llm_runner_3" >}}), we will parse GPT-2 [[Radford et al., 2019]](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and run causal (decoder) inference;
+
+{{< callout type="note" icon="🏋️" title="A word about traingin" >}}
+
+As we will see, LLMs can be seen as composition of many parametrized functions. The value of these parameters called _weights_ are automatically adjusted during a process called _training_. These parameters intervene as matrices coefficients in linear operations that are performed in these functions.
+
+When the coefficients of a matrix are automatically adjusted during training, we say that the matrix is _learned_ and we usually call that matrix $W$ with some subscript.
+
+In these posts we take training for granted and focus on the mathematical operations performed by the LLM.
+
+{{< /callout >}}
 
 # What is a LLM?
 
-LLMs can be seen as mathematical functions that transform sequences of tokens into a probability distribution over the token space.
+LLMs are large scale transformers that are trained on huge dataset to perform langage related tasks. LLMs and transformers can be seen as mathematical functions that transform sequences of tokens into a probability distribution over the token space.
 That is to say a function
 $$\mathrm{llm}: T^{\mathrm{seq\_len}} \rightarrow [0, 1]^{n_T}$$
 
@@ -36,30 +48,14 @@ For that we will use the [tokenizers](https://docs.rs/tokenizers/latest/tokenize
 
 {{< /callout >}}
 
-Given a sequence of tokens, an LLM can be used iteratively to generate the next token in the sequence, in a process called "Inference".
+Depending on the tasks for which the model is trained, it's output can be interpreted in different ways. Here are two examples corresponding to what we will be doint in [Part II]({{< relref "/posts/llm_runner_2" >}}) and [Part III]({{< relref "/posts/llm_runner_3" >}}).
 
-This would for example look like
+- **Masked language modeling (MLM)**: The model is trained to predict the tokens that should replace a `[MASK]` token in a sequence. That is to say the model is trained to predict the tokens that should replace a `[MASK]` token in a sequence.
+- **Causal self-attention (decoder)**: The model is trained to predict the next token in a sequence, given the previous tokens. Models that are trained for this task can be used to generate text iteratively, token by token.
 
-```rust
-fn infer(tokens: &mut Vec<Token>, n: usize) {
-    for _ in 0..n {
-        let output = llm(tokens.as_slice());
+# The Transformer architecture
 
-        // Alternatively, sample output as a probability distribution.
-        let argmax = output.iter().enumerate().max_by_key(|(_, &x)| x).unwrap().0;
-        tokens.push(Token::from_token_id(argmax));
-    }
-}
-```
-
-# How is the output of the LLM defined?
-
-The mathematical operations performed by the LLM are determined by two components:
-
-- The _architecture_ of the LLM, which defines the operations that are successively applied to the input.
-- The _weights_ of the LLM, which are the parameters of these mathematical operations.
-
-Here we will focus on the architecture described in [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762). This paper introduces the Transformer architecture, which leverages the attention mechanism—that is, the use of this operation:
+The Transformer architecture, introduced in [[Vas17]](https://arxiv.org/abs/1706.03762) leverages the _attention mechanism_ that is to say, the use of the following operation:
 
 $$\mathrm{Attention(Q, K, V)} = \mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
@@ -99,11 +95,17 @@ $$\mathrm{encoder}: T^{\mathrm{seq\_len}} \rightarrow H^{\mathrm{seq\_len}}$$
 Where $H=\mathbb{R}^{d_{\mathrm{model}}}$ is the _hidden state_ space of dimension $d_{\mathrm{model}}$.
 Vectors in $H$ embed a contextualized representation of the input sequence in a space of dimension $d_{\mathrm{model}}$.
 
-The _decoder_ is responsible for generating the output sequence from the hidden states. It can be seen as a function
+The _decoder_ is responsible for generating a sequence of tokens in a process called _autoregressive inference_ by taking as input the hidden states of the encoder and the tokens of the output sequence so far. It can be seen as a function
 
 $$\mathrm{decoder}: H^{\mathrm{seq\_len}} \times T^{n_{\mathrm{out}}} \rightarrow [0, 1]^{n_T}$$
 
-That will use the output of the encoder and the tokens of the output sequence so far to generate the next token in the sequence.
+The output of the decoder is a probability distribution over the token space $T$.
+
+{{< callout type="note" icon="💡" >}}
+
+Sometimes the term _logits_ is used to refer to the output of an LLM. Logits are the **unnormalized** (in the sense they don't sum to 1) probabilities of the tokens in the token space $T$. They are typically passed through a softmax function to obtain probabilities.
+
+{{< /callout >}}
 
 ## Embeddings
 
