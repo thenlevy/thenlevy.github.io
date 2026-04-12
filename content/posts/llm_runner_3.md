@@ -76,7 +76,7 @@ So in order to parse GPT-2 weights, we need to implement dedicated constructors 
             return Err(Error::InvalidData);
         }
 
-        // The weights W_q, W_k, W_v are stored in a single W_fused matix so that
+        // The weights W_q, W_k, W_v are stored in a single W_fused matrix so that
         // [K, V, Q] = x @ W_fused.
         // Then, in GPT-2 implementation the attention scores are computed "Conv1D-style":
         // y = x @ W + b.
@@ -298,6 +298,6 @@ We are going on vacation to the beach, yes I know climate change is not in the n
 ```
 
 The continuations are only **32 new tokens**, so lines end mid-sentence (`Please don`, `We must`). Still, they show that the full path is working: tokenization, forward passes, and decoding back to text.
-The output's quality is not perfect, grammar mistake and even incoherent word/sentences appear, but still, the output gives a vague impression of pseudo-coherence.
+The output's quality is not perfect, grammar mistakes and even incoherent words or sentences appear, but it still gives a vague impression of pseudo-coherence.
 
 On my laptop, the program took about 57 seconds to generate 32 tokens. Speeding up evaluation could be a good topic for a later post. I am also curious to dig deeper into tokenization and eventually implement it ourselves.

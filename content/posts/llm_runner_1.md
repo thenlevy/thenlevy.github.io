@@ -14,7 +14,7 @@ In this post, we will focus on the general mathematical operations performed by 
 
 In [Part II]({{< relref "/posts/llm_runner_2" >}}), we parse an actual model and run it on user-written prompts (via MLM and `[MASK]`). In [Part III]({{< relref "/posts/llm_runner_3" >}}), we parse GPT-2 and run causal (decoder) inference; that work is in [PR #2](https://github.com/thenlevy/llm-runner/pull/2).
 
-# What is a LLM?
+# What is an LLM?
 
 LLMs can be seen as mathematical functions that transform sequences of tokens into a probability distribution over the token space.
 That is to say a function
@@ -31,7 +31,7 @@ fn llm(tokens: &[Token]) -> Vec<f32> {
 ```
 
 {{< callout type="note" icon="🤔" >}}
-Because the LLM act on a sequence of tokens, the user's text input must be converted into a sequence of tokens before it can be passed to the model. This conversion is called _tokenization_.
+Because the LLM acts on a sequence of tokens, the user's text input must be converted into a sequence of tokens before it can be passed to the model. This conversion is called _tokenization_.
 For that we will use the [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) crate. For now, we'll use it as a black box, and we may deep dive into how tokenization is implemented in a future post.
 
 {{< /callout >}}
@@ -79,7 +79,7 @@ $$\mathrm{softmax}(x) = \frac{\exp(x)}{\sum_{i=1}^{n}\exp(x_i)}$$
 
 ```rust
 fn softmax(x: &[f32]) -> Vec<f32> {
-    // Directly translating the above formula would lead to computing exponential of large
+    // Directly translating the above formula would lead to computing the exponential of large
     // numbers, leading to numeric instability (esp on `f32`s).
     // This implementation is mathematically equivalent, but more stable.
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -118,13 +118,13 @@ The embedding layer maps a sequence of token indices to such a matrix.
 In practice, the sequence of tokens of length $\leq \mathrm{seq\_len}$ is represented as a vector $x \in \{0,\ldots,n_T-1\}^{\mathrm{seq\_len}}$ with $x_i$ the id of the token at position $i$.
 
 The embedding is then computed as follows:
-Let $W_e \in \mathbb{R}^{n_T \times d_{\mathrm{model}}}$ be the learnt _token embedding_ matrix (row $j$ is the vector for token $j$) and let $P_e \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ be the matrix of _positional encodings_ for those positions (fixed or learnt), so that each row encodes where the token sits in the sequence.
+Let $W_e \in \mathbb{R}^{n_T \times d_{\mathrm{model}}}$ be the learned _token embedding_ matrix (row $j$ is the vector for token $j$) and let $P_e \in \mathbb{R}^{\mathrm{seq\_len} \times d_{\mathrm{model}}}$ be the matrix of _positional encodings_ for those positions (fixed or learned), so that each row encodes where the token sits in the sequence.
 
 {{< callout type="note" icon="📍" title="Why positional encodings matter" >}}
 Token embeddings alone tell the model **which** symbols appear, but not **where** they appear. Attention compares pairs of positions using the same rules at every index, so without extra positional signal the representation would treat the sequence much like an unordered bag of tokens: reordering rows would not be distinguished in the way natural language requires.
 Adding $P_e$ addresses that by making the vector at each index depend on its position.
 
-In the implementation below, $P_e$ is a **learnt** matrix (one row per position), as in many modern systems. In the original Transformer [Vas17](https://arxiv.org/abs/1706.03762), each position $\mathrm{pos}$ and dimension was instead filled with sines and cosines at geometrically spaced wavelengths.
+In the implementation below, $P_e$ is a **learned** matrix (one row per position), as in many modern systems. In the original Transformer [Vas17](https://arxiv.org/abs/1706.03762), each position $\mathrm{pos}$ and dimension was instead filled with sines and cosines at geometrically spaced wavelengths.
 
 $$P_e(\mathrm{pos}, 2i) = \sin\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right), \qquad P_e(\mathrm{pos}, 2i+1) = \cos\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right).$$
 {{< /callout >}}
@@ -289,7 +289,7 @@ $$
 \mathrm{MultiHead}(X) = \mathrm{Concat}(\mathrm{head}_1, \ldots, \mathrm{head}_h)\, W^O + b^O\,.
 $$
 
-Where $W^O$ and $b^O$ are learned weights and bias specific to each attention layer.
+Where $W^O$ and $b^O$ are learned weights and a bias specific to each attention layer.
 
 `src/layers/attention.rs` (`linear` and `add_bias_rows` live in `src/layers/mod.rs`):
 

@@ -171,7 +171,7 @@ Here is an extract of the parsing, showing how we parse the embedding layer.
 
 {{< callout type="note" icon="🤔" title="Vocab projector weights" >}}
 
-When implementing the parsing, I thought the parameters of the vocab projector were missing from the safetensors file, so I've downloaded them in [NumPy format](https://numpy.org/doc/2.1/reference/generated/numpy.lib.format.html#format-version-1-0) from the pytorch model file using [Netron.app](https://netron.app/) and implemented parsing from this format
+When implementing the parsing, I thought the parameters of the vocab projector were missing from the safetensors file, so I've downloaded them in [NumPy format](https://numpy.org/doc/2.1/reference/generated/numpy.lib.format.html#format-version-1-0) from the PyTorch model file using [Netron.app](https://netron.app/) and implemented parsing from this format
 
 ```rust
         let vocab_project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
