@@ -452,10 +452,9 @@ The future does not keep a `TcpListener` field. It reconstructs one with `TcpLis
 
 ### Reading lines from a `TcpStream` asynchronously
 
-What we got by accepting a connection is a `TcpStream`. We need to be able to read lines from it asynchronously.
+Accepting a connection yields a `TcpStream`. The next step is to read from it without blocking the executor: same pattern as the listener—non-blocking socket, `OwnedFd`, reactor registration.
 
 ```rust
-
 pub struct AsyncTcpStream {
     _inner: Rc<OwnedFd>,
     source: Rc<RefCell<IoSource>>,
@@ -467,7 +466,6 @@ impl AsyncTcpStream {
 
         let fd = Rc::new(OwnedFd::from(stream));
         let source = Reactor::add_source(fd.clone())?;
-        dbg!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
         Ok(Self { _inner: fd, source })
     }
 
@@ -475,6 +473,16 @@ impl AsyncTcpStream {
         TcpStreamLines::new(self)
     }
 }
+```
+
+`AsyncTcpStream` mirrors `AsyncTcpListener::bind`: the stream is switched to non-blocking mode, wrapped in `Rc<OwnedFd>`, and registered with `Reactor::add_source`.
+Like `accept()`, `get_lines()` performs no I/O by itsel and only constructs a `TcpStreamLines` that will read when polled.
+
+`TcpStreamLines` uses a similar pattern to [`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) over [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html): it **batches** reads into a fixed buffer (`buf`), tracks consumed bytes (`pos`, `cap`), and assembles lines across refills (`next_line`).
+A `BorrowedFd` ties the helper’s lifetime to the underlying `AsyncTcpStream` so the raw fd view stays valid.
+
+```rust
+const BUF_SIZE: usize = 4096;
 
 pub struct TcpStreamLines<'s> {
     inner: BorrowedFd<'s>,
@@ -496,63 +504,88 @@ impl<'s> TcpStreamLines<'s> {
             next_line: Vec::new(),
         }
     }
+}
+```
 
-    fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<std::io::Result<String>>> {
-        loop {
-            // If we have consumed all the bytes of the buffer, fill it
-            if self.pos >= self.cap {
-                // SAFETY `self._inner` is open because we own a valid reference to it and is a
-                // valid fd for a TcpStream.
-                let mut stream = unsafe { TcpStream::from_raw_fd(self.inner.as_raw_fd()) };
-                self.cap = match stream.read(self.buf.as_mut_slice()) {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
-                            let _ = stream.into_raw_fd();
-                            return Poll::Ready(Some(Err(e)));
-                        }
+The actual implementation lives in `poll_line`, a loop that alternates refilling the buffer and scanning it.
+Whenever the in-memory window `[pos, cap)` is empty, we need another kernel `read`.
+Here, we use the same pattern as we did to asynchronously `accept` a TCP connection: we build a temporary `TcpStream` with `from_raw_fd`, call `read`, then **detach** with `into_raw_fd` so we never close the shared fd.
 
-                        // Drop the stream without closing the associated file
-                        let _ = stream.into_raw_fd();
-                        return Poll::Pending;
-                    }
-                    ret => {
-                        self.pos = 0;
-                        let _ = stream.into_raw_fd();
-                        ret
-                    }
-                }?;
-            }
-            if self.cap == 0 {
-                return Poll::Ready(None);
+```rust
+// Inside `poll_line` — refill when the buffer window is empty
+if self.pos >= self.cap {
+    // SAFETY: `inner` borrows the open `TcpStream` fd for the lifetime of `TcpStreamLines`.
+    let mut stream = unsafe { TcpStream::from_raw_fd(self.inner.as_raw_fd()) };
+    self.cap = match stream.read(self.buf.as_mut_slice()) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
+                let _ = stream.into_raw_fd();
+                return Poll::Ready(Some(Err(e)));
             }
 
-            if let Some(i) = self.buf[self.pos..self.cap]
-                .iter()
-                .position(|b| *b == b'\n')
-            {
-                // Do not take the \n
-                self.next_line
-                    .extend_from_slice(&self.buf[self.pos..(self.pos + i)]);
-                self.pos += i + 1;
-                if let Ok(mut ret) = String::from_utf8(std::mem::take(&mut self.next_line)) {
-                    if ret.ends_with('\r') {
-                        ret.pop();
-                    }
-                    return Poll::Ready(Some(Ok(ret)));
-                } else {
-                    return Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Not utf8",
-                    ))));
-                }
-            } else {
-                self.next_line
-                    .extend_from_slice(&self.buf[self.pos..self.cap]);
-                self.pos = self.cap;
-            }
+            // Drop the stream without closing the associated file
+            let _ = stream.into_raw_fd();
+            return Poll::Pending;
         }
-    }
+        ret => {
+            self.pos = 0;
+            let _ = stream.into_raw_fd();
+            ret
+        }
+    }?;
+}
+```
 
+If `read` returns `WouldBlock`, we register the task’s waker as a **reader** on the `IoSource` and return `Poll::Pending`; the reactor will wake us when data arrives. A successful read updates `cap` (and resets `pos`); the surrounding `loop` in `poll_line` then either parses a line from `[pos, cap)` or runs this refill again.
+
+```rust
+// Still inside the same `loop` in `poll_line`, after a non-empty buffer
+if self.cap == 0 {
+    return Poll::Ready(None);
+}
+
+if let Some(i) = self.buf[self.pos..self.cap]
+    .iter()
+    .position(|b| *b == b'\n')
+{
+    // Do not take the \n
+    self.next_line
+        .extend_from_slice(&self.buf[self.pos..(self.pos + i)]);
+    self.pos += i + 1;
+    if let Ok(mut ret) = String::from_utf8(std::mem::take(&mut self.next_line)) {
+        if ret.ends_with('\r') {
+            ret.pop();
+        }
+        return Poll::Ready(Some(Ok(ret)));
+    } else {
+        return Poll::Ready(Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Not utf8",
+        ))));
+    }
+} else {
+    self.next_line
+        .extend_from_slice(&self.buf[self.pos..self.cap]);
+    self.pos = self.cap;
+}
+```
+
+If `cap == 0` we have reached the end of the file and return `None`.
+Otherwise, if we are able to find a newline character (`\n`) we append all the bytes until the newline to `next_line` and return it.
+Finally, if we do not find a newline character we append the remaining bytes to `next_line` and continue the loop.
+
+{{< callout type="note" icon="📌" title="Async `next` and the `Stream` trait" >}}
+In the `futures` crate, [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) is the asynchronous counterpart of [`Iterator`](https://doc.rust-lang.org/std/iter/trait.Iterator.html): the stream itself is polled for the _next_ item via [`poll_next`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#tymethod.poll_next), which returns `Poll<Option<T>>`. The [`StreamExt::next`](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.next) helper wraps that in a [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html), so consuming a stream in async code looks like repeated `await`s—exactly the “async function” feel of `lines.next()`.
+
+While `TcpStreamLines` does not implement `futures::Stream` directly (because we want to keep dependencies minimal), it exposes a similar interface: each call to `next()` returns a fresh `TcpLinesNext` future whose `Output` is an `Option<…>`.
+
+The standard library’s [`AsyncIterator`](https://doc.rust-lang.org/std/async_iter/trait.AsyncIterator.html) (still unstable) standardizes the `Stream` interface.
+{{< /callout >}}
+
+Finally, `next` packages `poll_line` behind a `Future` so call sites can `await` one line at a time.
+
+```rust
+impl<'s> TcpStreamLines<'s> {
     pub fn next<'a>(&'a mut self) -> TcpLinesNext<'a, 's> {
         TcpLinesNext { lines: self }
     }
@@ -573,24 +606,7 @@ impl<'a, 's> Future for TcpLinesNext<'a, 's> {
 }
 ```
 
-`AsyncTcpStream` mirrors the listener setup: the underlying `TcpStream` is made non-blocking, wrapped in `OwnedFd`, and registered with the reactor through `Reactor::add_source`.
-The stream keeps both the `Rc<OwnedFd>` (so the socket stays open) and the `Rc<RefCell<IoSource>>` (so tasks can subscribe for “readable” wakeups).
-
-In the same way that `AsyncTcpListener::accept()` does not read anything by itself, the `AsyncTcpStream::get_lines()` method does not read anything by itself: It only builds a `TcpStreamLines` value that can produce lines asynchronously when its `next` method is called.
-
-{{< callout type="note" icon="📌" title="Async `next` and the `Stream` trait" >}}
-In the `futures` crate, [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) is the asynchronous counterpart of [`Iterator`](https://doc.rust-lang.org/std/iter/trait.Iterator.html): the stream itself is polled for the _next_ item via [`poll_next`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#tymethod.poll_next), which returns `Poll<Option<T>>`. The [`StreamExt::next`](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.next) helper wraps that in a [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html), so consuming a stream in async code looks like repeated `await`s—exactly the “async function” feel of `lines.next()`.
-
-While `TcpStreamLines` does not implement `futures::Stream` directly (because we want to keep dependencies minimal), it exposes a similar interface: each call to `next()` returns a fresh `TcpLinesNext` future whose `Output` is an `Option<…>`.
-
-The standard library’s [`AsyncIterator`](https://doc.rust-lang.org/std/async_iter/trait.AsyncIterator.html) (still unstable) standardizes the `Stream` interface.
-{{< /callout >}}
-
-`TcpStreamLines` plays the same role over our non-blocking socket that [`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) plays over any [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html):
-it **batches** kernel reads into an internal buffer area and looks for newlines in the buffer before asking for more bytes.
-If a newline could not be found in the buffer, we **refill** it with one more asynchronous `read`.
-This read is performed in a similar way to how we asynchronously accepted connections on our `TcpListener`:
-If `read` returns `WouldBlock`, we register the current waker as a reader on the `IoSource` and return `Poll::Pending`.
+Each `TcpLinesNext` is cheap: it only holds a mutable borrow of the line buffer and forwards `poll` to `poll_line`, where the state machine and buffer live.
 
 ### Writing to a `TcpStream` asynchronously
 
