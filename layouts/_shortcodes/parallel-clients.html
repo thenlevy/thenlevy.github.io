@@ -1,0 +1,7 @@
+{{- $renderOpts := dict "display" "block" -}}
+{{- $chunks := split .Inner "---PARALLEL---" -}}
+<div class="parallel-clients" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;margin:1rem 0;align-items:start;">
+{{- range $chunks -}}
+  <div class="parallel-clients__col">{{ $.Page.RenderString $renderOpts (trim . "\n") }}</div>
+{{- end -}}
+</div>

@@ -1,7 +1,7 @@
 ---
 date: "2026-04-19T11:15:00+02:00"
 draft: false
-title: async_runtime Part I: Introduction to asynchronous programming in Rust.
+title: "async_runtime Part I: Introduction to asynchronous programming in Rust."
 description: "Introduction to asynchronous programming and the tasks that an asynchronous runtime must perform."
 ---
 
@@ -212,8 +212,8 @@ Once the listener is bound, we _spawn a detached task_: it `await`s `Timer::afte
 Here we use:
 
 - The `async` block syntax to declare the task.
-- The `[smol::spawn](https://docs.rs/smol/latest/smol/fn.spawn.html)` method to start the task.
-- The `[smol::Task::detach](https://docs.rs/smol/latest/smol/struct.Task.html#method.detach)` method to move the add the task to the list of the tasks whose execution is scheduled by the runtime and resume the execution of the current task.
+- The [`smol::spawn`](https://docs.rs/smol/latest/smol/fn.spawn.html) method to start the task.
+- The [`smol::Task::detach`](https://docs.rs/smol/latest/smol/struct.Task.html#method.detach) method to move the add the task to the list of the tasks whose execution is scheduled by the runtime and resume the execution of the current task.
   Spawning a detached task can be seen as an equivalent of spawning a thread in a context where we delegate scheduling to the OS.
 
 The **`run` method** is the connection-accepting loop. On each iteration it waits **concurrently** for either a message on `event_receiver` (a game-ending event, which breaks the loop) or an accepted TCP connection.
@@ -308,12 +308,37 @@ fn main() {
 }
 ```
 
-When the program is running, we can connect to the server using several tcp clients that play the game in parallel.
+When the program is running, we can connect to the server using several TCP clients that play the game in parallel—for example by opening **two terminals** and running `nc` in each:
+
+{{< parallel-clients >}}
 
 ```bash
-nc 127.0.0.1 8080
-
+# Client 1
+nc 127.0.0.1 8080                  15:26:35
 50
+Too high!
+25
+Too high!
+13
+Too high!
+8
 Too low!
-Game over! Time's up.
+10
+Too low!
+12
+Correct!
 ```
+
+---PARALLEL---
+
+```bash
+# Client 2
+nc 127.0.0.1 8080
+50
+Too high!
+23
+Too high!
+Game over! Someone else won.
+```
+
+{{< /parallel-clients >}}
