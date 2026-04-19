@@ -198,7 +198,9 @@ impl Server {
 The `Server` struct holds the listening socket, a broadcast channel end for game-ending events (`TimeOut` or `SomeoneWon`), and the corresponding receiver the main task will wait on.
 
 Note `new` is an ordinary synchronous function, yet `TcpListener::bind` is asynchronous. We must therefore drive that future to completion with `smol::block_on`, which **blocks the current OS thread** until the listener is bound.
-That is acceptable here: no other tasks exist yet, so nothing is starved while we wait. Aleternatively, we could have made `new` asynchronous by using the `async/await` syntax:
+That is acceptable here: no other tasks exist yet, so nothing is starved while we wait.
+
+Aleternatively, we could have made `new` asynchronous by using the `async/await` syntax:
 
 ```rust
 async fn new(addr: &str, game_duration: Duration) -> Self {
@@ -212,7 +214,7 @@ Once the listener is bound, we _spawn a detached task_: it `await`s `Timer::afte
 Here we use:
 
 - The `async` block syntax to declare the task.
-- The [`smol::spawn`](https://docs.rs/smol/latest/smol/fn.spawn.html) method to start the task.
+- The [`smol::spawn`](https://docs.rs/smol/latest/smol/fn.spawn.html) method to poll the futures to which the block evaluates to completion.
 - The [`smol::Task::detach`](https://docs.rs/smol/latest/smol/struct.Task.html#method.detach) method to move the add the task to the list of the tasks whose execution is scheduled by the runtime and resume the execution of the current task.
   Spawning a detached task can be seen as an equivalent of spawning a thread in a context where we delegate scheduling to the OS.
 
@@ -342,3 +344,7 @@ Game over! Someone else won.
 ```
 
 {{< /parallel-clients >}}
+
+Note that this all works because the runtime is internally keeping track of what every tasks is waiting for and wakes them up when the dependencies are resolved.
+
+In future posts we will dive into the details of the runtime and see how it works internally.
