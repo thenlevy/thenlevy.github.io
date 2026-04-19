@@ -2,3 +2,13 @@
 :root {
     --main-width: 880px;
 }
+
+/*
+ * PaperMod sets `margin: auto 4px` on `.post-content code`, which reads as extra space
+ * around inline code next to punctuation (parentheses, commas). Tighten inline only;
+ * `.post-content pre code` keeps the theme’s block styles (higher specificity).
+ */
+.post-content code {
+    margin-inline: 0.08em;
+    padding: 0.12em 0.35em;
+}
