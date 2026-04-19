@@ -88,6 +88,10 @@ We can see that the main loop algorithm can be summarized as follows:
 Our `Reactor` is based on the [`epoll`](https://man7.org/linux/man-pages/man7/epoll.7.html) system call.
 This system call is the key mechanism that will allow our tasks to be woken up when they can make progress.
 
+{{< callout type="note" icon="🐧" title="Linux-specific implementation" >}}
+Relying on `epoll`, which is a Linux-specific system call, means that the runtime is not portable to other OSes. Porting it to another OS means swapping the reactor for that platform’s multiplexing mechanism (for example `kqueue` on BSD/macOS or overlapped I/O on Windows).
+{{< /callout >}}
+
 What `epoll` offers is an interface to
 
 - Register interest in events on file descriptors (typically readiness to read or write) without blocking with the [`epoll_ctl`](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html) system call.
@@ -99,7 +103,11 @@ The reactor can then map those descriptors back to the tasks that were waiting o
 
 Here is a relevant extract of the implementation. Since we are using a low-level system call, the reader is invited to read the [full implementation](https://github.com/thenlevy/async_runtime/blob/master/src/a_la_mano/reactor.rs) for more details.
 
+The reactor is a process-wide singleton (via a static `HANDLE`); the structs below are the core state: an `epoll` fd, a map from event keys to I/O sources, and a Unix socket pair used to wake the reactor when work is scheduled from outside the poll loop.
+
 ```rust
+static HANDLE: AtomicPtr<Reactor> = AtomicPtr::new(core::ptr::null_mut());
+
 pub struct Reactor {
     epoll_fd: OwnedFd,
     sources: HashMap<EventKey, Rc<RefCell<IoSource>>>,
@@ -114,81 +122,176 @@ pub struct IoSource {
     readers: Vec<Waker>,
     writers: Vec<Waker>,
 }
+```
+
+Each `IoSource` wraps one non-blocking fd, tracks which tasks are waiting for read vs write readiness, and carries a stable `EventKey` that `epoll` echoes back in `epoll_event.u64` so wakeups can be routed without relying on the raw fd number alone.
+
+Registering a new fd adds it to the epoll set with `EPOLL_CTL_ADD` and stores an `IoSource` in `sources`. User-visible interest updates go through `register_interest`, which issues `EPOLL_CTL_MOD` with a bitmask derived from our `Event` type. The implementation always sets `EPOLLONESHOT`, so each edge of readiness consumes the registration and the reactor must re-arm after handling an event (see `block_on_event_and_react` below).
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventKey(u64);
+
+#[derive(Debug)]
+pub struct Event {
+    key: EventKey,
+    pub readable: bool,
+    pub writable: bool,
+}
 
 impl Reactor {
-
-    pub fn block_on_event_and_react() -> std::io::Result<()> {
+    pub fn add_source(fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
         let this = Self::get();
+        this.add_source_inner(fd)
+    }
+
+    fn add_source_inner(&mut self, fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
+        let key = EventKey::new();
+        let epoll_event: EpollEvent = Event::none(key).into();
+        let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
+
+        let ret = unsafe {
+            epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd.as_ref().as_raw_fd(),
+                (&mut libc_epoll_event) as *mut libc::epoll_event,
+            )
+        };
+
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let new_source = Rc::new(RefCell::new(IoSource {
+            fd: fd,
+            key,
+            readers: Vec::new(),
+            writers: Vec::new(),
+        }));
+        self.sources.insert(key, new_source.clone());
+        Ok(new_source)
+    }
+
+    pub fn register_interest(fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
+        let this = Self::get();
+        this.register_interest_inner(fd, interest)
+    }
+
+    fn register_interest_inner(&self, fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
+        let epoll_event: EpollEvent = interest.into();
+        let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
+
+        let ret = unsafe {
+            epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_MOD,
+                fd.as_raw_fd(),
+                (&mut libc_epoll_event) as *mut libc::epoll_event,
+            )
+        };
+
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+```
+
+`EventKey::new()` hands out unique keys from a global counter. `Event` is the logical “what we care about” on a source; it is converted to `libc::epoll_event` (including `EPOLLONESHOT` and `EPOLLIN` / `EPOLLOUT`) elsewhere in the file.
+
+The heart of blocking is `epoll_wait`: the reactor allocates a buffer of `epoll_event` structs, waits indefinitely (`timeout = -1`), maps errors so `EINTR` yields zero events, then converts each kernel event back into our `Event` type via the embedded `u64` key.
+
+```rust
+impl Reactor {
+    const MAX_EVENT: u32 = 1024;
+
+    fn wait_for_events(&self) -> std::io::Result<Vec<Event>> {
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
-
-        // Interests to be re-registered after the one-shot epoll_wait call.
-        let mut interests = Vec::new();
-
-        let res = {
-            let nb_events = unsafe {
+        let nb_events = {
+            let epoll_result = unsafe {
                 libc::epoll_wait(
-                    this.epoll_fd.as_raw_fd(),
+                    self.epoll_fd.as_raw_fd(),
                     events.as_mut_ptr(),
                     Self::MAX_EVENT as i32,
                     -1,
                 )
             };
 
-            if nb_events == -1 {
+            if epoll_result < 0 {
                 Err(std::io::Error::last_os_error())
             } else {
-                Ok(nb_events)
-            }
-        };
-        match res {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-            Err(e) => Err(e),
-            Ok(nb_events) => {
-                assert!(nb_events >= 0);
-                // The wakers to be woken up.
-                let mut wakers = Vec::with_capacity(nb_events as usize);
-                let events = &events[0..nb_events as usize];
-                for event in events {
-                    let epoll_event = EpollEvent::from(*event);
-                    let event = Event::from(epoll_event);
-
-                    if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
-                    {
-                        // If the event is readable, add all the wakers that are waiting for it to be
-                        // readable. If the event is writable, add all the
-                        // wakers that are waiting for it to be writable.
-                        if event.readable {
-                            source.drain_readers_into(&mut wakers);
-                        }
-                        if event.writable {
-                            source.drain_writers_into(&mut wakers);
-                        }
-                        let event = source.waiting_for();
-
-                        // If the source is still waiting for further events, we must re-register
-                        // the interest.
-                        if event.readable || event.writable {
-                            interests.push((source.fd.clone(), event));
-                        }
-                    }
-                }
-                for (fd, interest) in interests {
-                    Self::register_interest(fd.as_fd(), interest).unwrap();
-                }
-                for waker in wakers {
-                    waker.wake();
-                }
-
-                // Clear the spawn notifications; see the callout above 🪤 Note on blocking on the reactor
-                {
-                    // ....
-                }
-                Ok(())
+                Ok(epoll_result)
             }
         }
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                // `epoll_wait` can return EINTR when a signal arrives before any fd is ready.
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        })?;
+
+        Ok(events
+            .iter()
+            .take(nb_events as usize)
+            .map(|event| Event::from(EpollEvent::from(*event)))
+            .collect())
     }
 }
 ```
+
+This is the function the executor calls when it has nothing ready to poll: it sleeps until the kernel reports readiness (or a signal interrupts the syscall).
+
+After `epoll_wait` returns (via `wait_for_events`), `block_on_event_and_react` propagates real I/O errors and returns immediately if the batch is empty—for example when `epoll_wait` was interrupted (`EINTR`) and `wait_for_events` maps that to zero events. Otherwise it looks up each `EventKey`, drains the wakers for the readiness directions that fired, recomputes what the source still needs (`waiting_for`), and re-registers interest with `register_interest` when the source still has pending waiters. Finally it wakes the tasks and drains the notify pipe so the self-pipe wakeup mechanism stays balanced.
+
+```rust
+impl Reactor {
+    pub fn block_on_event_and_react() -> std::io::Result<()> {
+        let this = Self::get();
+
+        // Interests to be re-registered after the one-shot epoll_wait call.
+        let mut interests = Vec::new();
+
+        let events = this.wait_for_events()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // The wakers to be woken up.
+        let mut wakers = Vec::with_capacity(events.len());
+        for event in events {
+            if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut()) {
+                if event.readable {
+                    source.drain_readers_into(&mut wakers);
+                }
+                if event.writable {
+                    source.drain_writers_into(&mut wakers);
+                }
+                let event = source.waiting_for();
+
+                // If the source is still waiting for further events, we must re-register
+                // the interest.
+                if event.readable || event.writable {
+                    interests.push((source.fd.clone(), event));
+                }
+            }
+        }
+        for (fd, interest) in interests {
+            Self::register_interest(fd.as_fd(), interest).unwrap();
+        }
+        for waker in wakers {
+            waker.wake();
+        }
+
+        this.clear_spawn_notifications()?;
+        Ok(())
+    }
+}
+```
+
+Together, `wait_for_events` and `block_on_event_and_react` close the loop: the executor blocks on the kernel until something is ready, then translates readiness into `Waker::wake` calls so polled futures can run again.
 
 # Implementing a TCP server
 
@@ -225,10 +328,24 @@ pub struct TcpConnectionAccept {
     source: Rc<RefCell<IoSource>>,
     state: TcpConnectionAcceptState,
 }
+```
 
-// This allows to convert `&mut self` into a `Pin<&mut Self>`.
-impl Unpin for TcpConnectionAccept {}
+`AsyncTcpListener::bind` creates a normal blocking `TcpListener`, switches it to _non-blocking_ mode.
+It then hands ownership of the socket to the reactor via `OwnedFd` and `Reactor::add_source`.
+From that point on, the reactor tracks the underlying fd in its epoll set, allowing tasks to register **wakers** on that source when they need to wait for “readable” (for a listening socket, that means a connection may be available to accept).
 
+{{< callout type="note" icon="👉" >}}
+Note that calling `accept()` does not perform I/O by itself. It only builds a fresh `TcpConnectionAccept` future in the `Start` state.
+
+This is a standard pattern for async Rust: the method does not perform anything by itself, but only returns a `Future`, which needs to be polled to perform the actual operation.
+{{< /callout >}}
+
+### Implementing `Future` for `TcpConnectionAccept`
+
+As is often the case, the implementation of the `Future` trait for `TcpConnectionAccept` relies on an internal state machine.
+Actually, the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
+
+```rust
 #[derive(Debug, Clone, Copy)]
 enum TcpConnectionAcceptState {
     Start,
@@ -237,12 +354,34 @@ enum TcpConnectionAcceptState {
     Finished,
 }
 
+impl Future for TcpConnectionAccept {
+    type Output = std::io::Result<(TcpStream, SocketAddr)>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.as_mut();
+        match this.state {
+            TcpConnectionAcceptState::Start => this.poll_start(cx),
+            TcpConnectionAcceptState::FirstAttemptBlocked => this.poll_first_attempt_blocked(cx),
+            TcpConnectionAcceptState::WokenWhenReady => this.poll_assume_ready(cx),
+            TcpConnectionAcceptState::Finished => {
+                panic!("poll called after TcpConnectionAccept is finished")
+            }
+        }
+    }
+}
+```
+
+Initially our future is in the `Start` state and tries to call `accept()` once. If the kernel has a pending connection, it returns `Poll::Ready` immediately.
+Otherwise, it calls `poll_first_attempt_blocked` to register its waker as a reader on the `IoSource` associated with the socket and returns `Pending` after setting the state to `WokenWhenReady`.
+
+When our future is in the `WokenWhenReady` state, it calls `poll_assume_ready` when polled. Here it assumes that a call to `accept()` cannot block again and treats `WouldBlock` as a logic bug (`panic!`).
+
+```rust
 impl TcpConnectionAccept {
     fn poll_start(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
-
         let source = self.source.borrow();
         // SAFETY: The fd of self.source is a valid TCP listener fd.
         let tcp_listener = unsafe { TcpListener::from_raw_fd(source.get_raw_fd()) };
@@ -302,43 +441,7 @@ impl TcpConnectionAccept {
     }
 }
 
-impl Future for TcpConnectionAccept {
-    type Output = std::io::Result<(TcpStream, SocketAddr)>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut();
-        match this.state {
-            TcpConnectionAcceptState::Start => this.poll_start(cx),
-            TcpConnectionAcceptState::FirstAttemptBlocked => this.poll_first_attempt_blocked(cx),
-            TcpConnectionAcceptState::WokenWhenReady => this.poll_assume_ready(cx),
-            TcpConnectionAcceptState::Finished => {
-                panic!("poll called after TcpConnectionAccept is finished")
-            }
-        }
-    }
-}
 ```
-
-`AsyncTcpListener::bind` creates a normal blocking `TcpListener`, switches it to _non-blocking_ mode.
-It then hands ownership of the socket to the reactor via `OwnedFd` and `Reactor::add_source`.
-From that point on, the reactor tracks the underlying fd in its epoll set, allowing tasks to register **wakers** on that source when they need to wait for “readable” (for a listening socket, that means a connection may be available to accept).
-
-{{< callout type="note" icon="👉" >}}
-Note that calling `accept()` does not perform I/O by itself. It only builds a fresh `TcpConnectionAccept` future in the `Start` state.
-
-This is a standard pattern for async Rust: the method does not perform anything by itself, but only returns a `Future`, which needs to be polled to perform the actual operation.
-{{< /callout >}}
-
-### Implementing `Future` for `TcpConnectionAccept`
-
-As is often the case, the implementation of the `Future` trait for `TcpConnectionAccept` relies on an internal state machine.
-
-In this case, the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
-
-Initially our future is in the `Start` state and tries to call `accept()` once. If the kernel has a pending connection, it returns `Poll::Ready` immediately.
-Otherwise, it calls `poll_first_attempt_blocked` to register its waker as a reader on the `IoSource` associated with the socket and returns `Pending` after setting the state to `WokenWhenReady`.
-
-When our future is in the `WokenWhenReady` state, it calls `poll_assume_ready` when polled. Here it assumes that a call to `accept()` cannot block again and treats `WouldBlock` as a logic bug (`panic!`).
 
 {{< callout type="note" icon="🪤" title="Why wrap `TcpListener` around a raw fd each time">}}
 The future does not keep a `TcpListener` field. It reconstructs one with `TcpListener::from_raw_fd` whenever it needs to call `accept()`, then **detaches** it with `into_raw_fd()` before dropping. The socket is owned by `OwnedFd` inside the reactor and the temporary `TcpListener` is just a typed view on it. Dropping it without `into_raw_fd()` would close the fd and break every other reference to the same listener.
