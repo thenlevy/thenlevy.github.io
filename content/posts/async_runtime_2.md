@@ -33,7 +33,6 @@ impl Executor {
             self.task_queue.borrow_mut().receive();
 
             // Run all tasks that are ready to make progress.
-            println!("Running {} tasks", self.task_queue.borrow().len());
             loop {
                 let Some(task) = self.task_queue.borrow_mut().pop() else {
                     break;
@@ -47,12 +46,7 @@ impl Executor {
                 };
             }
 
-            eprintln!("Receiving tasks");
             self.task_queue.borrow_mut().receive();
-            eprintln!(
-                "After running tasks, {} tasks remain",
-                self.task_queue.borrow().len()
-            );
 
             if Reactor::waiting_on_events() {
                 match Reactor::block_on_event_and_react() {
@@ -61,7 +55,6 @@ impl Executor {
                         if e.kind() == std::io::ErrorKind::Interrupted {
                             break;
                         }
-                        eprintln!("Error while waiting for IO events :{}", e);
                     }
                 }
             } else if self.task_queue.borrow().is_empty() {
@@ -158,7 +151,6 @@ impl Reactor {
                 for event in events {
                     let epoll_event = EpollEvent::from(*event);
                     let event = Event::from(epoll_event);
-                    eprintln!("got event {event:?}");
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
@@ -183,7 +175,6 @@ impl Reactor {
                 for (fd, interest) in interests {
                     Self::register_interest(fd.as_fd(), interest).unwrap();
                 }
-                eprintln!("Waking {} tasks", wakers.len());
                 for waker in wakers {
                     waker.wake();
                 }
@@ -251,7 +242,6 @@ impl TcpConnectionAccept {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
-        println!("Polling TcpConnectionAccept in Start state");
 
         let source = self.source.borrow();
         // SAFETY: The fd of self.source is a valid TCP listener fd.
@@ -260,7 +250,6 @@ impl TcpConnectionAccept {
         std::mem::drop(source);
 
         let ret = tcp_listener.accept();
-        println!("First accept attempt returned: {:?}", ret);
         match ret {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.state = TcpConnectionAcceptState::FirstAttemptBlocked;
@@ -407,16 +396,13 @@ impl<'s> TcpStreamLines<'s> {
 
     fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<std::io::Result<String>>> {
         loop {
-            eprintln!("Buffer pos: {}, cap: {}", self.pos, self.cap);
             // If we have consumed all the bytes of the buffer, fill it
             if self.pos >= self.cap {
                 // SAFETY `self._inner` is open because we own a valid reference to it and is a
                 // valid fd for a TcpStream.
                 let mut stream = unsafe { TcpStream::from_raw_fd(self.inner.as_raw_fd()) };
-                eprintln!("Poll reading");
                 self.cap = match stream.read(self.buf.as_mut_slice()) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        eprintln!("Would block");
                         if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
                             let _ = stream.into_raw_fd();
                             return Poll::Ready(Some(Err(e)));
@@ -427,7 +413,6 @@ impl<'s> TcpStreamLines<'s> {
                         return Poll::Pending;
                     }
                     ret => {
-                        eprintln!("Ready");
                         self.pos = 0;
                         let _ = stream.into_raw_fd();
                         ret
@@ -580,13 +565,11 @@ async fn run() {
         tcp::AsyncTcpListener::bind("127.0.0.1:8080").expect("Failed to bind TCP listener");
 
     loop {
-        eprintln!("Waiting for incoming TCP connections...");
         let (tcp_stream, _addr) = tcp_listener
             .accept()
             .await
             .expect("Failed to accept TCP connection");
 
-        println!("Accepted connection from {:?}", tcp_stream.peer_addr());
         if let Err(e) = Executor::spawn(handle_connection(Rc::new(
             tcp::AsyncTcpStream::from_tcp_stream(tcp_stream).unwrap(),
         ))) {
@@ -595,28 +578,21 @@ async fn run() {
     }
 }
 
+
 async fn handle_connection(stream: Rc<tcp::AsyncTcpStream>) {
     let mut lines = stream.get_lines();
 
     while let Some(line) = lines.next().await {
-        let Ok(mut line) = line.inspect_err(|e| {
-            println!("Error while reading line: {:?}", e);
+        let Ok(line) = line.inspect_err(|e| {
+            eprintln!("Error while reading line: {e:?}");
         }) else {
             continue;
         };
 
-        let spawn_handle = Rc::clone(&stream);
-        Box::pin(async move {
-            line = format!("{}!!!\n", line.to_uppercase());
-            spawn_handle
-                .write_all(line.as_bytes())
-                .await
-                .inspect_err(|e| {
-                    println!("Error while writing line back to client: {e:?}");
-                })
-                .ok();
-        })
-        .await;
+        let reply = format!("{}!!!\n", line.to_uppercase());
+        if let Err(e) = stream.write_all(reply.as_bytes()).await {
+            eprintln!("Error while writing line back to client: {e:?}");
+        }
     }
 }
 
