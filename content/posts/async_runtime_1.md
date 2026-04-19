@@ -348,3 +348,4 @@ Game over! Someone else won.
 Note that this all works because the runtime is internally keeping track of what every task is waiting for and wakes them up when the dependencies are resolved.
 
 In future posts we will dive into the details of the runtime and see how it works internally.
+The whole implementation of the `smol`-based sever can be found [here](https://github.com/thenlevy/async_runtime/blob/master/src/with_smol/mod.rs)
