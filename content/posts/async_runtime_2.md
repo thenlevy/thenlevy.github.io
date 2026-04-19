@@ -7,15 +7,15 @@ description: "Building the core components of our asynchronous runtime, and writ
 
 In [the previous post]({{< relref "/posts/async_runtime_1" >}}) we saw how asynchronous programming can be used to write concurrent programs in Rust.
 
-In this post, we will start writing our own asynchronous runtime, and we will see an overview of it's different components.
-Our implementation is heavily inpired by this [series of posts](https://redixhumayun.github.io/async/2024/08/05/async-runtimes.html) and the actual code of the [`smol` runtime](https://github.com/smol-rs/).
+In this post, we will start writing our own asynchronous runtime, and we will see an overview of its different components.
+Our implementation is heavily inspired by this [series of posts](https://redixhumayun.github.io/async/2024/08/05/async-runtimes.html) and the actual code of the [`smol` runtime](https://github.com/smol-rs/).
 
 # Components
 
 The two main components of an asynchronous runtime are the `Executor` and the `Reactor`.
 
-- The `Executor` is responsible for scheduling tasks and executing them. It it contains the main execution loop of the runtime, that is responsible for polling the available tasks.
-- The `Reactor` is responsible for registering ressources that tasks are waiting for, and to wake up the appropriate tasks when the ressources are available.
+- The `Executor` is responsible for scheduling tasks and executing them. It contains the main execution loop of the runtime, which is responsible for polling the available tasks.
+- The `Reactor` is responsible for registering resources that tasks are waiting for, and for waking the appropriate tasks when those resources are available.
 
 ## The `Executor`
 
@@ -47,7 +47,7 @@ impl Executor {
                 };
             }
 
-            eprintln!("Recieving tasks");
+            eprintln!("Receiving tasks");
             self.task_queue.borrow_mut().receive();
             eprintln!(
                 "After running tasks, {} tasks remain",
@@ -75,17 +75,17 @@ impl Executor {
 
 {{< callout type="note" icon="🪤" title="Note on blocking on the reactor" >}}
 Notice that the execution loop blocks on the `Reactor::block_on_event_and_react` call.
-This means that if a tasks spawns a new task before completing, the runtime could be waiting for events that unlocks other tasks even if the new one could already make progress.
+This means that if a task spawns a new task before completing, the runtime could be waiting for events that unlock other tasks even if the new one could already make progress.
 
 To avoid this, the `Reactor` has a `notify` method that is called when spawning a task.
 
-Calling this `notify` method ensures that the `Reactor` tells it that at least one task can make progress.
+Calling this `notify` method ensures the `Reactor` is notified that at least one task can make progress.
 
 Therefore the next time `block_on_event_and_react` is called, it will not hang if none of the events that it is waiting for are ready (but if some events are ready, it will wake up the tasks that are waiting on them).
 
 {{< /callout >}}
 
-We can see that the main loop alogorithm can be summarized as follows:
+We can see that the main loop algorithm can be summarized as follows:
 
 1. Run all tasks that are ready to make progress.
 2. Block until new tasks can make progress.
@@ -93,7 +93,7 @@ We can see that the main loop alogorithm can be summarized as follows:
 ## The `Reactor`
 
 Our `Reactor` is based on the [`epoll`](https://man7.org/linux/man-pages/man7/epoll.7.html) system call.
-This system call is the key mechanism that will allow our task to be woken up when they can make progress.
+This system call is the key mechanism that will allow our tasks to be woken up when they can make progress.
 
 What `epoll` offers is an interface to
 
@@ -162,9 +162,9 @@ impl Reactor {
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
-                        // If the event is readable, add all the wakes that are waiting for it to be
+                        // If the event is readable, add all the wakers that are waiting for it to be
                         // readable. If the event is writable, add all the
-                        // wakes that are waiting for it to be writable.
+                        // wakers that are waiting for it to be writable.
                         if event.readable {
                             source.drain_readers_into(&mut wakers);
                         }
@@ -188,7 +188,7 @@ impl Reactor {
                     waker.wake();
                 }
 
-                // Clear the spawn notifications see the callout above 🪤 Note on blocking on the reactor
+                // Clear the spawn notifications; see the callout above 🪤 Note on blocking on the reactor
                 {
                     // ....
                 }
@@ -337,17 +337,17 @@ From that point on, the reactor tracks the underlying fd in its epoll set, allow
 {{< callout type="note" icon="👉" >}}
 Note that calling `accept()` does not perform I/O by itself. It only builds a fresh `TcpConnectionAccept` future in the `Start` state.
 
-This is a standard pattern for async rust: The methods does not perform anything by itself, but only returns a Future, which needs to be polled to perform the actual operation.
+This is a standard pattern for async Rust: the method does not perform anything by itself, but only returns a `Future`, which needs to be polled to perform the actual operation.
 {{< /callout >}}
 
 ### Implementing `Future` for `TcpConnectionAccept`
 
 As is often the case, the implementation of the `Future` trait for `TcpConnectionAccept` relies on an internal state machine.
 
-In thise case, the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
+In this case, the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
 
 Initially our future is in the `Start` state and tries to call `accept()` once. If the kernel has a pending connection, it returns `Poll::Ready` immediately.
-Otherwise, it calls `poll_first_attempt_blocked` to register it's waker as a reader on the `IoSource` associated to the socket and returns `Pending` after setting the state to `WokenWhenReady`.
+Otherwise, it calls `poll_first_attempt_blocked` to register its waker as a reader on the `IoSource` associated with the socket and returns `Pending` after setting the state to `WokenWhenReady`.
 
 When our future is in the `WokenWhenReady` state, it calls `poll_assume_ready` when polled. Here it assumes that a call to `accept()` cannot block again and treats `WouldBlock` as a logic bug (`panic!`).
 
@@ -493,20 +493,20 @@ In the same way that `AsyncTcpListener::accept()` does not read anything by itse
 {{< callout type="note" icon="📌" title="Async `next` and the `Stream` trait" >}}
 In the `futures` crate, [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) is the asynchronous counterpart of [`Iterator`](https://doc.rust-lang.org/std/iter/trait.Iterator.html): the stream itself is polled for the _next_ item via [`poll_next`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#tymethod.poll_next), which returns `Poll<Option<T>>`. The [`StreamExt::next`](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.next) helper wraps that in a [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html), so consuming a stream in async code looks like repeated `await`s—exactly the “async function” feel of `lines.next()`.
 
-While `TcpStreamLines` does not implement `futures::Stream` directly (because we want to keep depencies minimal), it exposes a similar interface: each call to `next()` returns a fresh `TcpLinesNext` future whose `Output` is an `Option<…>`.
+While `TcpStreamLines` does not implement `futures::Stream` directly (because we want to keep dependencies minimal), it exposes a similar interface: each call to `next()` returns a fresh `TcpLinesNext` future whose `Output` is an `Option<…>`.
 
 The standard library’s [`AsyncIterator`](https://doc.rust-lang.org/std/async_iter/trait.AsyncIterator.html) (still unstable) standardizes the `Stream` interface.
 {{< /callout >}}
 
 `TcpStreamLines` plays the same role over our non-blocking socket that [`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) plays over any [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html):
 it **batches** kernel reads into an internal buffer area and looks for newlines in the buffer before asking for more bytes.
-If a newline could not be found in the buffer, we **refill** it with one more asychronous `read`.
-This read is performed in a similar way to how we asynchronously accepted connection on our `TcpListener`:
+If a newline could not be found in the buffer, we **refill** it with one more asynchronous `read`.
+This read is performed in a similar way to how we asynchronously accepted connections on our `TcpListener`:
 If `read` returns `WouldBlock`, we register the current waker as a reader on the `IoSource` and return `Poll::Pending`.
 
 ### Writing to a `TcpStream` asynchronously
 
-To write to a `TcpStream` asynchronously, we follow the same pattern as reading lines: we build a `Future` that will perform the write when it's polled. When polled, this futures will attempt to write its entire buffer to the stream, and register it's waker as a writer of it's `IoSource` when the write would block.
+To write to a `TcpStream` asynchronously, we follow the same pattern as reading lines: we build a `Future` that will perform the write when it is polled. When polled, this future will attempt to write its entire buffer to the stream, and register its waker as a writer on its `IoSource` when the write would block.
 
 ```rust
 impl AsyncTcpStream {
