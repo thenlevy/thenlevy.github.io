@@ -2,7 +2,7 @@
 date: "2026-04-19T19:00:00+02:00"
 draft: false
 title: "async_runtime Part II: Components of an asynchronous runtime"
-description: "Building the core components of our asynchronous runtime, and writing an asynchronous TCP server."
+description: "Building the core components of our asynchronous runtime (Executor and Reactor), and writing an asynchronous TCP server."
 ---
 
 In [the previous post]({{< relref "/posts/async_runtime_1" >}}) we saw how asynchronous programming can be used to write concurrent programs in Rust.
@@ -297,7 +297,7 @@ Together, `wait_for_events` and `block_on_event_and_react` close the loop: the e
 
 ## An asynchronous `TcpListener`
 
-Now that we have the core components of our runtime we can start implementing a TCP server.
+Now that we have the core components of our runtime, we can start implementing a TCP server.
 
 For that, we need to implement an asynchronous `TcpListener`. This will be the opportunity to see how to implement the `Future` trait.
 
@@ -342,8 +342,7 @@ This is a standard pattern for async Rust: the method does not perform anything 
 
 ### Implementing `Future` for `TcpConnectionAccept`
 
-As is often the case, the implementation of the `Future` trait for `TcpConnectionAccept` relies on an internal state machine.
-Actually, the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
+As is often the case, the implementation of the `Future` trait for `TcpConnectionAccept` relies on an internal state machine, and the `poll` method is a simple match statement that delegates to the appropriate method based on the current state.
 
 ```rust
 #[derive(Debug, Clone, Copy)]
@@ -476,7 +475,7 @@ impl AsyncTcpStream {
 ```
 
 `AsyncTcpStream` mirrors `AsyncTcpListener::bind`: the stream is switched to non-blocking mode, wrapped in `Rc<OwnedFd>`, and registered with `Reactor::add_source`.
-Like `accept()`, `get_lines()` performs no I/O by itsel and only constructs a `TcpStreamLines` that will read when polled.
+Like `accept()`, `get_lines()` performs no I/O by itself and only constructs a `TcpStreamLines` that will read when polled.
 
 `TcpStreamLines` uses a similar pattern to [`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) over [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html): it **batches** reads into a fixed buffer (`buf`), tracks consumed bytes (`pos`, `cap`), and assembles lines across refills (`next_line`).
 A `BorrowedFd` ties the helper’s lifetime to the underlying `AsyncTcpStream` so the raw fd view stays valid.
@@ -560,7 +559,7 @@ if let Some(i) = self.buf[self.pos..self.cap]
     } else {
         return Poll::Ready(Some(Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Not utf8",
+            "invalid UTF-8",
         ))));
     }
 } else {
@@ -571,8 +570,8 @@ if let Some(i) = self.buf[self.pos..self.cap]
 ```
 
 If `cap == 0` we have reached the end of the file and return `None`.
-Otherwise, if we are able to find a newline character (`\n`) we append all the bytes until the newline to `next_line` and return it.
-Finally, if we do not find a newline character we append the remaining bytes to `next_line` and continue the loop.
+Otherwise, if we find a newline character (`\n`), we append all the bytes up to (but not including) the newline to `next_line` and return the line.
+Finally, if we do not find a newline, we append the remaining bytes to `next_line` and continue the loop.
 
 {{< callout type="note" icon="📌" title="Async `next` and the `Stream` trait" >}}
 In the `futures` crate, [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) is the asynchronous counterpart of [`Iterator`](https://doc.rust-lang.org/std/iter/trait.Iterator.html): the stream itself is polled for the _next_ item via [`poll_next`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#tymethod.poll_next), which returns `Poll<Option<T>>`. The [`StreamExt::next`](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.next) helper wraps that in a [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html), so consuming a stream in async code looks like repeated `await`s—exactly the “async function” feel of `lines.next()`.
@@ -640,7 +639,7 @@ impl<'s, 'b> Future for TcpStreamWriteAll<'s, 'b> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = Pin::get_mut(self);
-        // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
+        // SAFETY: `inner` borrows the open `TcpStream` fd for the lifetime of `TcpStreamWriteAll`.
         let mut stream = unsafe { TcpStream::from_raw_fd(this.inner.as_raw_fd()) };
 
         while !this.buf.is_empty() {
@@ -676,7 +675,7 @@ impl<'s, 'b> Future for TcpStreamWriteAll<'s, 'b> {
 
 # Putting it all together: A simple TCP server
 
-Now that we have the core components of our asynchronous runtime, we can start implementing a simple TCP server. This server runs asynchronously on a single thread and can handle multiple connections, and has a single dependency on the `libc` crate to handle the `epoll` syscalls.
+Now that we have the core components of our asynchronous runtime, we can implement a simple TCP server. It runs on a single thread, multiplexes multiple connections, and depends on the `libc` crate only for the `epoll` syscalls.
 
 ```rust
 async fn run() {
