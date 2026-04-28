@@ -688,16 +688,16 @@ async fn run() {
             .await
             .expect("Failed to accept TCP connection");
 
-        if let Err(e) = Executor::spawn(handle_connection(Rc::new(
+        if let Err(e) = Executor::spawn(handle_connection(
             tcp::AsyncTcpStream::from_tcp_stream(tcp_stream).unwrap(),
-        ))) {
+        )) {
             println!("Failed to spawn task: {e}");
         }
     }
 }
 
 
-async fn handle_connection(stream: Rc<tcp::AsyncTcpStream>) {
+async fn handle_connection(stream: tcp::AsyncTcpStream) {
     let mut lines = stream.get_lines();
 
     while let Some(line) = lines.next().await {
