@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["bonsai",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.95.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"struct\" href=\"bonsai/storage/page/struct.LocationIndex.html\" title=\"struct bonsai::storage::page::LocationIndex\">LocationIndex</a>&gt; for <a class=\"primitive\" href=\"https://doc.rust-lang.org/1.95.0/std/primitive.usize.html\">usize</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.95.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"struct\" href=\"bonsai/storage/page/struct.PageFlags.html\" title=\"struct bonsai::storage::page::PageFlags\">PageFlags</a>&gt; for <a class=\"primitive\" href=\"https://doc.rust-lang.org/1.95.0/std/primitive.u16.html\">u16</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.95.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"struct\" href=\"bonsai/struct.TransactionId.html\" title=\"struct bonsai::TransactionId\">TransactionId</a>&gt; for <a class=\"primitive\" href=\"https://doc.rust-lang.org/1.95.0/std/primitive.u32.html\">u32</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.95.0/core/convert/trait.From.html\" title=\"trait core::convert::From\">From</a>&lt;<a class=\"struct\" href=\"bonsai/struct.XLogRecPtr.html\" title=\"struct bonsai::XLogRecPtr\">XLogRecPtr</a>&gt; for <a class=\"primitive\" href=\"https://doc.rust-lang.org/1.95.0/std/primitive.u64.html\">u64</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1539]}
