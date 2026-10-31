@@ -1,27 +1,27 @@
 ---
 date: "2026-10-29T21:00:00+01:00"
 draft: false
-title: "`bonzai` Part I: How Postgres lays out a table on disk"
+title: "`bonzai` Part I: How Postgres stores pages on disk"
 description: "Finding the file behind a Postgres table, reading its first 8 KB page byte by byte, then fetching and parsing pages in Rust."
 ---
 
-I have started [`bonzai`](https://github.com/thenlevy/bonzai): a small B-tree engine that mimics Postgres's on-disk format. My goal with this project,
-is to understand the internals of some of Postgres's features (MVCC, crash recovery, etc..) by implementing them myself.
+I have started [`bonzai`](https://github.com/thenlevy/bonzai): a small B-tree engine that mimics Postgres's on-disk format. My goal with this project is to understand the internals of some of Postgres's features (MVCC, crash recovery, etc.) by implementing them myself.
 As I progress, I want to write posts about the concepts that I will learn along the way, and show how they translate into code.
 
-I this article, we look at how Postgres lays out its data on disk, and we implement utilities to read and parse Postgres pages from the file system.
+In this article, we look at where Postgres stores a table on disk and how its pages are laid out, and we implement utilities to read and parse Postgres pages from the file system.
+The rows stored inside these pages will be the subject of a later post.
 
 # Looking at a table on disk
 
 ## Setting up a cluster
 
-Beffore digging into code, let's start by inspecting files actually created by Postgres.
-We start by creating a new _cluster_ (i.e. a collections of databases managed by a Postgres instance), and starting an instance to manage it.
+Before digging into code, let's start by inspecting files actually created by Postgres.
+We start by creating a new _cluster_ (i.e. a collection of databases managed by a Postgres instance), and starting an instance to manage it.
 Then we create the `bonzai` database and connect to it:
 
 ```sh
-# Create a new cluster
-# --data-checksums makes Postgres store a checksum in every page, and is off by default before Postgres 18.
+# Create a new cluster, with a checksum in every page
+# (--data-checksums is the default only since Postgres 18)
 initdb -D data --data-checksums -U postgres -A trust
 # Start the postgres instance
 pg_ctl -D data -l log start
@@ -32,8 +32,8 @@ psql -U postgres -d bonzai
 ```
 
 Using the `psql` client, we create a table with a few rows, and we use the `CHECKPOINT` command to force the changes to be written to disk.
-This is needed because, in order to optimize disk IO, Postgres will only modify it's in-memory version of the data after the `INSERT`.
-In "regular use" the data would be written to the disk later, `CHECKPOINT` forces that to happen now.
+This is needed because, to save disk I/O, the `INSERT` only modifies Postgres's in-memory copy of the page.
+In regular use, the page would be written to disk later; `CHECKPOINT` forces that to happen now.
 
 ```sql
 CREATE TABLE t (id int8 GENERATED ALWAYS AS IDENTITY, payload text);
@@ -41,8 +41,8 @@ INSERT INTO t (payload) VALUES ('Hello, World!'), ('Bonjour Bonsai'), ('An other
 CHECKPOINT;
 ```
 
-Note that, despite keeping the modified data in-memory, Postgress is still able to gurantee data recovery after a crash.
-We will see how when we explore the functioning of the WAL.
+Note that, despite keeping the modified data in memory, Postgres can still guarantee that committed data survives a crash.
+We will see how when we explore the WAL.
 
 ## Finding the file holding our table's data
 
@@ -60,7 +60,7 @@ bonzai=# SELECT oid, datname FROM pg_database;
 ```
 
 Each _relation_ (table, index, sequence, ...) of a database is associated with up to four _forks_:
-The _main fork_, that contains the actual data stored in the relation, and optionally the _free space map fork_ (`fsm`), the _visibility map fork_ (`vm`), and the _init fork_.
+the _main fork_, which contains the actual data stored in the relation, and optionally the _free space map fork_ (`fsm`), the _visibility map fork_ (`vm`), and the _init fork_.
 
 We'll explore the `fsm` and `vm` forks when we discuss how `VACUUM` works.
 
@@ -76,7 +76,7 @@ bonzai=# SELECT oid, relname, relfilenode FROM pg_class WHERE relname = 't';
 
 This tells us that the main fork of our table is called `16386`.
 
-Big forks of over 1GB are split into _segments_ each stored as a file of up to 1 GB.
+Forks larger than 1 GB are split into _segments_, each stored as a file of up to 1 GB.
 The first segment is stored in a file whose name is exactly the name of the fork, and the names of subsequent segments are suffixed with `.{idx}` where `idx` starts at 1 for the 2nd segment: `16386`, `16386.1`, `16386.2`, ...
 See [Database File Layout](https://www.postgresql.org/docs/current/storage-file-layout.html) in the Postgres documentation for the details.
 
@@ -96,7 +96,7 @@ bonzai=# SELECT pg_relation_filepath('t');
 (1 row)
 ```
 
-Forks segments, are sequences of blocks of `BLCKSZ` bytes, where `BLCKSZ` is a constant chosen when Postgres is compiled. In practice `BLCKSZ` is almost always 8192 bytes, and this is the value we'll use in `bonzai`.
+Fork segments are sequences of blocks of `BLCKSZ` bytes, where `BLCKSZ` is a constant chosen when Postgres is compiled. In practice `BLCKSZ` is almost always 8192 bytes, and this is the value we'll use in `bonzai`.
 
 Block `n` of a fork starts at position `n * BLCKSZ` bytes from the start of the fork (counting across its segments).
 
@@ -106,7 +106,7 @@ Postgres tends to use the word _block_ when talking about a position in a file a
 
 ## The first page
 
-Our table is small, so it has only one block. It's main fork is therefore stored in a single file that is 8192 bytes long:
+Our table is small, so it has only one block. Its main fork is therefore stored in a single file that is 8192 bytes long:
 
 ```text
 $ wc -c data/base/16384/16386
@@ -134,11 +134,11 @@ $ hexdump -C data/base/16384/16386
 00002000
 ```
 
-Before we dive into the details of how to interpret those bytes, we can already nottice that the file has the following structure:
+Before we dive into the details of how to interpret those bytes, we can already notice that the file has the following structure:
 
-- There are non zero bytes at the very beggining of the file
-- Then a long empty region
-- Then a non empty region, that notably contains the three strings that we inserted into the table, in reverse order of insertion.
+- There are non-zero bytes at the very beginning of the file.
+- Then a long empty region.
+- Then a non-empty region, that notably contains the three strings that we inserted into the table, in reverse order of insertion.
 
 # Anatomy of a page ([PR #1](https://github.com/thenlevy/bonzai/pull/1))
 
@@ -155,10 +155,10 @@ All pages share the same layout, described in [bufpage.h](https://github.com/pos
 - An array of **line pointers** of 4 bytes each, one per tuple, which grows forward.
 - The **tuples** (versions of rows), which are added from the end of the page and grow backward.
 - The **free space** in between. The page is full when the two meet.
-- At the very end, a **special space** reserved for the access method. This space is for example used by B-Tree indexes to embbed their topology.
+- At the very end, a **special space** reserved for the access method. B-tree indexes, for example, use it to embed their topology.
   Heap pages (pages that store the data) do not use it.
 
-In our hexdump above, the "non zero region at the beginning" corresponds to the header and the line pointers, and the "non empty region at the end" corresponds to the tuples.
+In our hexdump above, the "non-zero region at the beginning" corresponds to the header and the line pointers, and the "non-empty region at the end" corresponds to the tuples.
 
 | Bytes            | Content                    |
 | ---------------- | -------------------------- |
@@ -204,18 +204,18 @@ Here is how these fields map to the first 24 bytes of our page:
 
 In a few words:
 
-- `pd_lsn` is used to locate the page in the WAL.
-- `pd_checksum` is the page's checksum.
-- `pd_flags` holds hints about properties of the page.
-- `pd_lower`, `pd_upper` and `pd_special` are the boundaries of the diagram above.
-- `pd_pagesize_version` packs the page size and the version of the layout (4, since Postgres 8.3) into a single 16-bit integer.
-- `pd_prune_xid` tells Postgres when pruning the page might be worth it. Nothing was deleted yet, so there is nothing to prune.
+- `pd_lsn` (_log sequence number_) is the position in the WAL just past the last record that modified the page. This is the heart of write-ahead logging: the buffer manager won't write the page to disk until the WAL has been flushed up to that point, and crash recovery uses it to skip the records the page already reflects.
+- `pd_checksum` is a 16-bit checksum of the page's content and of its block number, set when the page is written to disk (see [Checksums](#checksums) below).
+- `pd_flags` holds three hint bits: some line pointers are unused and can be reused (`PD_HAS_FREE_LINES`), a recent `UPDATE` found no room on the page (`PD_PAGE_FULL`), and every row on the page is visible to every transaction (`PD_ALL_VISIBLE`).
+- `pd_lower`, `pd_upper` and `pd_special` are the boundaries of the diagram above: our three line pointers end at 24 + 3 × 4 = 36, our tuples start at 8048, and heap pages have no special space, so `pd_special` is the end of the page.
+- `pd_pagesize_version` packs the page size and the version of the layout (4, since Postgres 8.3) into a single 16-bit integer: 8192 \| 4 = 8196.
+- `pd_prune_xid` is the oldest transaction that deleted or updated a row on the page, a hint that pruning the page may free some space. Nothing was deleted yet, so it is zero.
 
-The [rustdocs](/bonzai/part-1/doc/bonsai/storage/page/struct.Header.html) of the project goes into more details.
+The project's [rustdoc](/bonzai/part-1/doc/bonsai/storage/page/struct.Header.html) goes into more detail.
 
 ### Parsing the header
 
-Fields are stored in the byte order of the machine, `bonzai` assumes little-endian (see `read_u16` bellow).
+Fields are stored in the machine's byte order, and `bonzai` assumes little-endian (see `read_u16` below).
 How the LSN is parsed is a bit convoluted for historical reasons:
 The LSN used to be handled as two 32-bit integers, a "log file" number and an offset within that file, so that the WAL could grow past 4 GB using only 32-bit integers.
 It has been a single 64-bit integer since Postgres 9.3, but pages still store the two halves so that the on-disk format did not change.
@@ -295,12 +295,12 @@ Header {
 With data checksums enabled, every page carries a 16-bit checksum of its content, computed when the page is written to disk and verified when it is read back.
 It is meant to detect corruption caused by the storage stack (disk, controller, file system), not to resist tampering.
 
-For Bonzai, we use an AI translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h).
+A deep dive into the algorithm that computes the checksum would go beyond the scope of this series.
+What really matters is that `bonzai` computes exactly the same value as Postgres, which the tests below check.
 
-Two details are worth noting:
+We therefore rely on a AI generated translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h) to Rust.
 
-- The block number is part of the checksum, so a perfectly valid page written at the wrong place in the file is detected. Our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339.
-- A checksum is never 0, so that 0 can mean "this page has no checksum".
+Still, one property is worth pointing out: the checksum validation function takes the block number into account, so a valid page written at the wrong place is caught (our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339).
 
 ```rust
 /// The checksum `page` should carry when stored at `block`. The page's own
@@ -308,7 +308,6 @@ Two details are worth noting:
 pub fn checksum_page(page: &Page, block: BlockNumber) -> u16 {
     // Mixing in the block number catches a valid page written to the wrong place.
     let checksum = checksum_block(page) ^ block.0;
-    // Fold to 16 bits, plus one so that a checksum is never zero.
     (checksum % 65535 + 1) as u16
 }
 ```
@@ -366,7 +365,7 @@ On the write side, [`Page::try_set_checksum_for_block`](/bonzai/part-1/doc/bonsa
 
 # Testing framework ([PR #1](https://github.com/thenlevy/bonzai/pull/1))
 
-Let's test our implementation against Postgres: we should be able to read pages written by Postrgres, parse their headers and check that their checksums match.
+Let's test our implementation against Postgres: we should be able to read pages written by Postgres, parse their headers and check that their checksums match.
 
 To that end, we create a small testing framework, made of three pieces:
 
@@ -376,9 +375,8 @@ To that end, we create a small testing framework, made of three pieces:
 
 ## Building a cluster
 
-The scripts [`tests/fixtures/make-db.sh`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/fixtures/make-db.sh)
-rebuilds a cluster from scratch in the git-ignored `postgres/` directory.
-It then runs every `tests/fixtures/*.sql` script, storing postgres's output in `postgres/<name>.facts`, and stops the server cleanly so that every page is on disk.
+The script [`tests/fixtures/make-db.sh`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/fixtures/make-db.sh) rebuilds a cluster from scratch in the git-ignored `postgres/` directory.
+It then runs every `tests/fixtures/*.sql` script, storing Postgres's output in `postgres/<name>.facts`, and stops the server cleanly so that every page is on disk.
 
 ## Recording what Postgres sees
 
@@ -436,6 +434,9 @@ special=8192
 pagesize_version=8196
 prune_xid=0
 ```
+
+These values differ from our walkthrough because the fixture runs in another cluster, in its `postgres` database (OID 5).
+Since it creates no database first, the identity sequence takes OID 16384 and the table 16385, and the LSN and the checksum differ too.
 
 ## Comparing with `bonzai`
 
@@ -502,7 +503,7 @@ A last test checks that the page fails validation as block 1.
 # Reading blocks from a fork ([PR #2](https://github.com/thenlevy/bonzai/pull/2))
 
 In the tests above, the page is read from the file system directly.
-In Postgres, Fetching the page from the file system, is the job of the _storage manager_ ([`smgr.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/smgr.c) and [`md.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/md.c)).
+In Postgres, fetching pages from the file system is the job of the _storage manager_ ([`smgr.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/smgr.c) and [`md.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/md.c)).
 
 In `bonzai`, this is done by the [`StorageManager`](/bonzai/part-1/doc/bonsai/storage/manager/struct.StorageManager.html).
 
@@ -554,7 +555,7 @@ fn position(&self, block: BlockNumber) -> Position {
 }
 ```
 
-When loading a fork, `bonzai` mimics Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285): It opens the segments in order and stops after the first segment that isn't full (because only the last segment of a fork can be paritially filled).
+When loading a fork, `bonzai` mimics Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285): it opens the segments in order and stops after the first segment that isn't full (only the last segment of a fork can be partially filled).
 
 ```rust
 fn load_fork(&self, fork: ForkIdentifier) -> Result<OpenFork, ForkError> {
@@ -583,14 +584,7 @@ fn load_fork(&self, fork: ForkIdentifier) -> Result<OpenFork, ForkError> {
             Ok(open)
         })
 }
-```
 
-`open_segment` returns `Ok(None)` when there is no such segment, which `transpose()?` turns into the end of the iteration, while an error is passed on to `try_fold`, which stops at the first one.
-
-The two other rules live in `open_segment`, which counts the blocks of a single segment.
-A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error:
-
-```rust
 /// Opens segment `segno` of `fork` and counts its blocks. `None` if there
 /// is no such segment, except for segment 0: a missing fork is an error.
 fn open_segment(&self, fork: ForkIdentifier, segno: u32) -> Result<Option<Segment>, ForkError> {
@@ -660,9 +654,9 @@ pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockE
 }
 ```
 
-# Putting it all togethter
+# Putting it all together
 
-We are now able to fetch and validated pages of our table in a few lines:
+We can now fetch and validate the pages of our table in a few lines:
 
 ```rust
 let smgr = StorageManager::open("data/base/16384").unwrap();
@@ -678,7 +672,7 @@ smgr.read(block, &mut page).unwrap();
 let validated = page.try_validated_for_block(block.block_number).unwrap();
 ```
 
-We apply this test to every block of every fork in the `postgres` database of the cluster built by `make-db.sh` in [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
+We run this check on every block of every fork in the `postgres` database of the cluster built by `make-db.sh` in [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
 
 ```rust
 for entry in fs::read_dir(FIXTURE_DB).unwrap() {
