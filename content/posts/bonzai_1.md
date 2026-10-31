@@ -554,9 +554,85 @@ fn position(&self, block: BlockNumber) -> Position {
 }
 ```
 
-The subtle part is knowing how many blocks a fork has.
-Like Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285), `bonzai` opens the segments in order and adds up their sizes, stopping after the first segment that isn't full, since only the last segment of a fork can be partly full.
-A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error.
+When loading a fork, `bonzai` mimics Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285): It opens the segments in order and stops after the first segment that isn't full (because only the last segment of a fork can be paritially filled).
+
+```rust
+fn load_fork(&self, fork: ForkIdentifier) -> Result<OpenFork, ForkError> {
+    let empty = OpenFork {
+        segments: Vec::new(),
+        nb_blocks: BlockCount(0),
+    };
+    let mut previous_full = true;
+    (0..)
+        // Stops at the first missing segment, or after the first one that
+        // isn't full: only the last segment can be partly full.
+        .map_while(|segno| {
+            if !previous_full {
+                return None;
+            }
+            let segment = self.open_segment(fork, segno).transpose()?;
+            previous_full = segment
+                .as_ref()
+                .is_ok_and(|segment| segment.nb_blocks == self.n_block_per_segment);
+            Some(segment)
+        })
+        .try_fold(empty, |mut open, segment| {
+            let segment = segment?;
+            open.segments.push(segment.file);
+            open.nb_blocks.0 += segment.nb_blocks.0;
+            Ok(open)
+        })
+}
+```
+
+`open_segment` returns `Ok(None)` when there is no such segment, which `transpose()?` turns into the end of the iteration, while an error is passed on to `try_fold`, which stops at the first one.
+
+The two other rules live in `open_segment`, which counts the blocks of a single segment.
+A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error:
+
+```rust
+/// Opens segment `segno` of `fork` and counts its blocks. `None` if there
+/// is no such segment, except for segment 0: a missing fork is an error.
+fn open_segment(&self, fork: ForkIdentifier, segno: u32) -> Result<Option<Segment>, ForkError> {
+    let path = self.path(fork, segno);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        // The previous segment was full and nothing comes after it.
+        Err(err) if segno > 0 && err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ForkError {
+                fork,
+                inner: ForkErrorInner::Io(err),
+            });
+        }
+    };
+    // A partly written block at the end, left by a crash, doesn't
+    // count, as in `mdnblocks`.
+    let file_size = file
+        .metadata()
+        .map_err(|err| ForkError {
+            fork,
+            inner: err.into(),
+        })?
+        .len();
+    let blocks = file_size / (BLCKSZ as u64);
+    if blocks > u64::from(self.n_block_per_segment.0) {
+        return Err(ForkError {
+            fork,
+            inner: ForkErrorInner::SegmentFileInconsistentlyBig {
+                path,
+                file_size,
+                n_blocks_per_segment: self.n_block_per_segment,
+            },
+        });
+    }
+    Ok(Some(Segment {
+        file,
+        nb_blocks: BlockCount(blocks as u32),
+    }))
+}
+```
+
 The segments of a fork are opened and counted once, then cached, and reading a block checks that it exists before reading it at its offset:
 
 ```rust
@@ -584,7 +660,9 @@ pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockE
 }
 ```
 
-Putting the two PRs together, fetching and validating the page of our table takes a few lines:
+# Putting it all togethter
+
+We are now able to fetch and validated pages of our table in a few lines:
 
 ```rust
 let smgr = StorageManager::open("data/base/16384").unwrap();
@@ -600,12 +678,7 @@ smgr.read(block, &mut page).unwrap();
 let validated = page.try_validated_for_block(block.block_number).unwrap();
 ```
 
-`validated.page().header()` gives back the header we parsed above, and reading block 1 fails with `BlockDoesNotExist { fork_size: BlockCount(1) }`: our table has a single block.
-
-PR #2 also comes with a test that does the same for every block Postgres wrote, [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
-It needs no fixture of its own: it opens a `StorageManager` on the `postgres` database of the cluster built by `make-db.sh`, and reads every block of every fork in it.
-These are the system catalogs and their B-tree indexes, their free space and visibility maps, and the relations created by the fixtures, 300 forks and 929 blocks in all.
-Each block must have the same bytes as in its file and pass `try_validated_for_block`, and reading one block past the end of the fork must fail:
+We apply this test to every block of every fork in the `postgres` database of the cluster built by `make-db.sh` in [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
 
 ```rust
 for entry in fs::read_dir(FIXTURE_DB).unwrap() {
