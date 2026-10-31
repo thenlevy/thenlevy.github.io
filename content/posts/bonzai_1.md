@@ -364,116 +364,11 @@ pub fn try_validated_for_block<'a>(
 
 On the write side, [`Page::try_set_checksum_for_block`](/bonzai/part-1/doc/bonsai/storage/page/struct.Page.html#method.try_set_checksum_for_block) refuses pages with an invalid header, stamps the checksum and returns a `ValidatedPage` too.
 
-# Reading blocks from a fork ([PR #2](https://github.com/thenlevy/bonzai/pull/2))
+# Testing framework ([PR #1](https://github.com/thenlevy/bonzai/pull/1))
 
-So far, we found our page by hand: we looked up the OID of the database and the `relfilenode` of the table, built the path of the file, and read 8192 bytes at the right offset.
-In Postgres, this is the job of the _storage manager_ ([`smgr.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/smgr.c) and [`md.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/md.c)), and PR #2 adds its `bonzai` counterpart, [`StorageManager`](/bonzai/part-1/doc/bonsai/storage/manager/struct.StorageManager.html).
+Let's test our implementation against Postgres: we should be able to read pages written by Postrgres, parse their headers and check that their checksums match.
 
-A block is addressed by its relation, its fork and its block number:
-
-```rust
-pub struct RelFileNumber(pub u32);
-
-pub enum ForkKind {
-    Main = 0,
-    FreeSpaceMap = 1,
-    VisibilityMap = 2,
-    Init = 3,
-}
-
-pub struct ForkIdentifier {
-    pub rel: RelFileNumber,
-    pub kind: ForkKind,
-}
-
-pub struct BlockIdentifier {
-    pub fork: ForkIdentifier,
-    pub block_number: BlockNumber,
-}
-```
-
-A `StorageManager` is opened on the directory of a database (`base/<database OID>`), and turns these addresses into a file and an offset, following the naming rules we saw above:
-
-```rust
-/// Path to the file holding the segment `segno` of `fork`.
-fn path(&self, fork: ForkIdentifier, segno: u32) -> PathBuf {
-    let mut name = fork.rel.0.to_string();
-    match fork.kind {
-        ForkKind::Main => {}
-        ForkKind::FreeSpaceMap => name.push_str("_fsm"),
-        ForkKind::VisibilityMap => name.push_str("_vm"),
-        ForkKind::Init => name.push_str("_init"),
-    }
-    if segno > 0 {
-        write!(&mut name, ".{segno}").unwrap();
-    }
-    self.dir.join(name)
-}
-
-fn position(&self, block: BlockNumber) -> Position {
-    let segno = block.0 / self.n_block_per_segment.0;
-    let offset = u64::from(block.0 % self.n_block_per_segment.0) * BLCKSZ as u64;
-    Position { segno, offset_bytes: offset }
-}
-```
-
-`n_block_per_segment` is normally `RELSEG_SIZE`, the number of blocks in 1 GB (131072), but it can be made smaller so that a few blocks are enough to span several segments.
-
-The subtle part is knowing how many blocks a fork has.
-Like Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285), `bonzai` opens the segments in order and adds up their sizes, stopping after the first segment that isn't full, since only the last segment of a fork can be partly full.
-A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error.
-The segments of a fork are opened and counted once, then cached, and reading a block checks that it exists before reading it at its offset:
-
-```rust
-/// Fetch the block from the disk and store its bits into `page`.
-pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockError> {
-    let fork = self.get_fork(block.fork).map_err(|err| BlockError {
-        block,
-        inner: BlockErrorInner::ForkError(err),
-    })?;
-    if !fork.nb_blocks.contains(block.block_number) {
-        return Err(BlockError {
-            block,
-            inner: BlockErrorInner::BlockDoesNotExist {
-                fork_size: fork.nb_blocks,
-            },
-        });
-    }
-    let Position { segno, offset_bytes } = self.position(block.block_number);
-    fork.segments[segno as usize]
-        .read_exact_at(page, offset_bytes)
-        .map_err(|err| BlockError {
-            block,
-            inner: BlockErrorInner::Io(err),
-        })
-}
-```
-
-Putting the two PRs together, fetching and validating the page of our table takes a few lines:
-
-```rust
-let smgr = StorageManager::open("data/base/16384").unwrap();
-let block = BlockIdentifier {
-    fork: ForkIdentifier {
-        rel: RelFileNumber(16386),
-        kind: ForkKind::Main,
-    },
-    block_number: BlockNumber(0),
-};
-let mut page = Page { bytes: [0; BLCKSZ] };
-smgr.read(block, &mut page).unwrap();
-let validated = page.try_validated_for_block(block.block_number).unwrap();
-```
-
-`validated.page().header()` gives back the header we parsed above, and reading block 1 fails with `BlockDoesNotExist { fork_size: BlockCount(1) }`: our table has a single block.
-
-# Testing framework
-
-Let's test our implementation against Postgres.
-For that, we need pages written by Postgres, and Postgres's own reading of them.
-Values such as the LSN or the checksum change from one cluster to the next, so they cannot be hard-coded in the tests.
-
-PR #1 therefore comes with a small testing framework, made of three pieces:
+To that end, we create a small testing framework, made of three pieces:
 
 - **a script**, `make-db.sh`, which builds a fresh cluster and runs the fixtures against it;
 - **fixtures**, SQL scripts that set up some state in the cluster and record what Postgres says about it;
@@ -481,9 +376,9 @@ PR #1 therefore comes with a small testing framework, made of three pieces:
 
 ## Building a cluster
 
-Everything starts with [`tests/fixtures/make-db.sh`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/fixtures/make-db.sh).
-It rebuilds a cluster from scratch in the git-ignored `postgres/` directory, with data checksums on, and starts a server that can only be reached through a socket inside that directory, so that it never clashes with another server.
-It then runs every `tests/fixtures/*.sql` script against that server, saves what each script prints to `postgres/<name>.facts`, and stops the server cleanly so that every page is on disk.
+The scripts [`tests/fixtures/make-db.sh`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/fixtures/make-db.sh)
+rebuilds a cluster from scratch in the git-ignored `postgres/` directory.
+It then runs every `tests/fixtures/*.sql` script, storing postgres's output in `postgres/<name>.facts`, and stops the server cleanly so that every page is on disk.
 
 ## Recording what Postgres sees
 
@@ -604,8 +499,112 @@ fn sealing_writes_back_what_postgres_wrote() {
 
 A last test checks that the page fails validation as block 1.
 
-PR #2 adds a test that needs no fixture of its own, [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
-It opens a `StorageManager` on the `postgres` database of the same cluster, and reads every block of every fork in it: the system catalogs and their B-tree indexes, their free space and visibility maps, and the relations created by the fixture: 300 forks and 929 blocks in all.
+# Reading blocks from a fork ([PR #2](https://github.com/thenlevy/bonzai/pull/2))
+
+In the tests above, the page is read from the file system directly.
+In Postgres, Fetching the page from the file system, is the job of the _storage manager_ ([`smgr.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/smgr.c) and [`md.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/md.c)).
+
+In `bonzai`, this is done by the [`StorageManager`](/bonzai/part-1/doc/bonsai/storage/manager/struct.StorageManager.html).
+
+A block is addressed by its relation, its fork and its block number:
+
+```rust
+pub struct RelFileNumber(pub u32);
+
+pub enum ForkKind {
+    Main = 0,
+    FreeSpaceMap = 1,
+    VisibilityMap = 2,
+    Init = 3,
+}
+
+pub struct ForkIdentifier {
+    pub rel: RelFileNumber,
+    pub kind: ForkKind,
+}
+
+pub struct BlockIdentifier {
+    pub fork: ForkIdentifier,
+    pub block_number: BlockNumber,
+}
+```
+
+A `StorageManager` is opened on the directory of a database (`base/<database OID>`), and turns these addresses into a file and an offset, following the naming rules we saw above:
+
+```rust
+/// Path to the file holding the segment `segno` of `fork`.
+fn path(&self, fork: ForkIdentifier, segno: u32) -> PathBuf {
+    let mut name = fork.rel.0.to_string();
+    match fork.kind {
+        ForkKind::Main => {}
+        ForkKind::FreeSpaceMap => name.push_str("_fsm"),
+        ForkKind::VisibilityMap => name.push_str("_vm"),
+        ForkKind::Init => name.push_str("_init"),
+    }
+    if segno > 0 {
+        write!(&mut name, ".{segno}").unwrap();
+    }
+    self.dir.join(name)
+}
+
+fn position(&self, block: BlockNumber) -> Position {
+    let segno = block.0 / self.n_block_per_segment.0;
+    let offset = u64::from(block.0 % self.n_block_per_segment.0) * BLCKSZ as u64;
+    Position { segno, offset_bytes: offset }
+}
+```
+
+The subtle part is knowing how many blocks a fork has.
+Like Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285), `bonzai` opens the segments in order and adds up their sizes, stopping after the first segment that isn't full, since only the last segment of a fork can be partly full.
+A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error.
+The segments of a fork are opened and counted once, then cached, and reading a block checks that it exists before reading it at its offset:
+
+```rust
+/// Fetch the block from the disk and store its bits into `page`.
+pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockError> {
+    let fork = self.get_fork(block.fork).map_err(|err| BlockError {
+        block,
+        inner: BlockErrorInner::ForkError(err),
+    })?;
+    if !fork.nb_blocks.contains(block.block_number) {
+        return Err(BlockError {
+            block,
+            inner: BlockErrorInner::BlockDoesNotExist {
+                fork_size: fork.nb_blocks,
+            },
+        });
+    }
+    let Position { segno, offset_bytes } = self.position(block.block_number);
+    fork.segments[segno as usize]
+        .read_exact_at(page, offset_bytes)
+        .map_err(|err| BlockError {
+            block,
+            inner: BlockErrorInner::Io(err),
+        })
+}
+```
+
+Putting the two PRs together, fetching and validating the page of our table takes a few lines:
+
+```rust
+let smgr = StorageManager::open("data/base/16384").unwrap();
+let block = BlockIdentifier {
+    fork: ForkIdentifier {
+        rel: RelFileNumber(16386),
+        kind: ForkKind::Main,
+    },
+    block_number: BlockNumber(0),
+};
+let mut page = Page { bytes: [0; BLCKSZ] };
+smgr.read(block, &mut page).unwrap();
+let validated = page.try_validated_for_block(block.block_number).unwrap();
+```
+
+`validated.page().header()` gives back the header we parsed above, and reading block 1 fails with `BlockDoesNotExist { fork_size: BlockCount(1) }`: our table has a single block.
+
+PR #2 also comes with a test that does the same for every block Postgres wrote, [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
+It needs no fixture of its own: it opens a `StorageManager` on the `postgres` database of the cluster built by `make-db.sh`, and reads every block of every fork in it.
+These are the system catalogs and their B-tree indexes, their free space and visibility maps, and the relations created by the fixtures, 300 forks and 929 blocks in all.
 Each block must have the same bytes as in its file and pass `try_validated_for_block`, and reading one block past the end of the fork must fail:
 
 ```rust
@@ -631,16 +630,6 @@ for entry in fs::read_dir(FIXTURE_DB).unwrap() {
 ```
 
 Here `fork_of` turns a file name such as `16385_fsm` into a `ForkIdentifier`, and skips other files such as `pg_filenode.map`.
-
-From the dev shell, building the cluster and running the tests is a matter of:
-
-```sh
-tests/fixtures/make-db.sh
-cargo test
-```
-
-Adding a fixture is a matter of adding a `.sql` file that sets up some state and prints what the tests need to know about it.
-This is how we will check the next pieces of `bonzai` against Postgres.
 
 # What's next
 
