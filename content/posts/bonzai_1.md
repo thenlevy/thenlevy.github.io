@@ -33,13 +33,17 @@ psql -U postgres -d bonzai
 ```
 
 Using the `psql` client, we create a table with a few rows, and we use the `CHECKPOINT` command to force the changes to be written to disk.
-The use of `CHECKPOINT` is necessary because Postgres does not write all changes to disk immediately and instead store them in a RAM buffer.
+This is needed because, in order to optimize disk IO, Postgres will only modify it's in-memory version of the data after the `INSERT`.
+In "regular use" the data would be written to the disk later, `CHECKPOINT` forces that to happen now.
 
 ```sql
 CREATE TABLE t (id int8 GENERATED ALWAYS AS IDENTITY, payload text);
 INSERT INTO t (payload) VALUES ('Hello, World!'), ('Bonjour Bonsai'), ('An other row');
 CHECKPOINT;
 ```
+
+Note that, despite keeping the modified data in-memory, Postgress is still able to gurantee data recovery after a crash.
+We will see how when we explore the functioning of the WAL.
 
 ## Finding the file holding our table's data
 
