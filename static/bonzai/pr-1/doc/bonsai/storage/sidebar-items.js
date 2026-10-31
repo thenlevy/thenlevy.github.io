@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["BLCKSZ"],"mod":["checksum","page"],"struct":["BlockNumber"]};

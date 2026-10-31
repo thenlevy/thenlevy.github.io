@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["HEADER_SIZE","PAGE_LAYOUT_VERSION"],"enum":["InvalidHeader","PageError"],"struct":["Header","LocationIndex","Page","PageFlags","ValidatedPage"]};

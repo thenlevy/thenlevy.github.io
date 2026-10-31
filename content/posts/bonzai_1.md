@@ -2,15 +2,14 @@
 date: "2026-10-29T21:00:00+01:00"
 draft: false
 title: "`bonzai` Part I: How Postgres lays out a table on disk"
-description: "Finding the file behind a Postgres table, reading its first 8 KB page byte by byte, and parsing it in Rust."
+description: "Finding the file behind a Postgres table, reading its first 8 KB page byte by byte, then fetching and parsing pages in Rust."
 ---
 
-Lately, trying to understand the difference between logical and physical replication in Postgres led me down a rabbit hole: how Postgres stores its data, and how B-tree storage engines work.
-
-This led me to start [`bonzai`](https://github.com/thenlevy/bonzai): a small B-tree engine that mimics Postgres's on-disk format. My goal with this project,
+I have started [`bonzai`](https://github.com/thenlevy/bonzai): a small B-tree engine that mimics Postgres's on-disk format. My goal with this project,
 is to understand the internals of some of Postgres's features (MVCC, crash recovery, etc..) by implementing them myself.
+As I progress, I want to write posts about the concepts that I will learn along the way, and show how they translate into code.
 
-This post accompanies the [first PR](https://github.com/thenlevy/bonzai/pull/1): we create a table, find the file that stores it, read its first 8 KB page byte by byte, and parse it with `bonzai`.
+I this article, we look at how Postgres lays out its data on disk, and we implement utilities to read and parse Postgres pages from the file system.
 
 # Looking at a table on disk
 
@@ -99,15 +98,15 @@ bonzai=# SELECT pg_relation_filepath('t');
 
 Forks segments, are sequences of blocks of `BLCKSZ` bytes, where `BLCKSZ` is a constant chosen when Postgres is compiled. In practice `BLCKSZ` is almost always 8192 bytes, and this is the value we'll use in `bonzai`.
 
-## The first page
-
-Block `n` of a fork starts at position `n * BLCKSZ` bytes from the start of the fork (counting across its segments), so our table currently has a single block.
+Block `n` of a fork starts at position `n * BLCKSZ` bytes from the start of the fork (counting across its segments).
 
 {{< callout type="note" icon="📄" title="Block or page?" >}}
 Postgres tends to use the word _block_ when talking about a position in a file and _page_ when referring to its content, but the two words are often used interchangeably.
 {{< /callout >}}
 
-Our table is small, so it's main fork is 8192 bytes long:
+## The first page
+
+Our table is small, so it has only one block. It's main fork is therefore stored in a single file that is 8192 bytes long:
 
 ```text
 $ wc -c data/base/16384/16386
@@ -135,12 +134,15 @@ $ hexdump -C data/base/16384/16386
 00002000
 ```
 
-Even without knowing anything about the format, a few things stand out: there is data at the very beginning of the file, data at the very end, and nothing but zeros in between (the `*` line means "same as the line above, repeated").
-Our three strings are at the end, in reverse order of insertion.
+Before we dive into the details of how to interpret those bytes, we can already nottice that the file has the following structure:
 
-# Anatomy of a page
+- There are non zero bytes at the very beggining of the file
+- Then a long empty region
+- Then a non empty region, that notably contains the three strings that we inserted into the table, in reverse order of insertion.
 
-All pages share the same layout, described in [bufpage.h](https://github.com/postgres/postgres/blob/master/src/include/storage/bufpage.h) and summarized in the documentation of `bonzai`'s [`page` module](/bonzai/pr-1/doc/bonsai/storage/page/index.html):
+# Anatomy of a page ([PR #1](https://github.com/thenlevy/bonzai/pull/1))
+
+All pages share the same layout, described in [bufpage.h](https://github.com/postgres/postgres/blob/master/src/include/storage/bufpage.h) and summarized in the documentation of `bonzai`'s [`page` module](/bonzai/part-1/doc/bonsai/storage/page/index.html):
 
 ```text
 +--------+---------------+----------------+--------------+---------+
@@ -153,11 +155,10 @@ All pages share the same layout, described in [bufpage.h](https://github.com/pos
 - An array of **line pointers** of 4 bytes each, one per tuple, which grows forward.
 - The **tuples** (versions of rows), which are added from the end of the page and grow backward.
 - The **free space** in between. The page is full when the two meet.
-- At the very end, a **special space** reserved for the access method. Heap pages don't use it, but B-tree pages store, among other things, links to their sibling pages there. We will need it later.
+- At the very end, a **special space** reserved for the access method. This space is for example used by B-Tree indexes to embbed their topology.
+  Heap pages (pages that store the data) do not use it.
 
-The line pointers add a level of indirection: a tuple is identified by its block number and the index of its line pointer (the pair is called its `ctid`), so Postgres can move a tuple around within its page, for instance to defragment the free space, by only updating its line pointer.
-
-In our hexdump:
+In our hexdump above, the "non zero region at the beginning" corresponds to the header and the line pointers, and the "non empty region at the end" corresponds to the tuples.
 
 | Bytes            | Content                    |
 | ---------------- | -------------------------- |
@@ -168,7 +169,7 @@ In our hexdump:
 
 ## The header
 
-In `bonzai`, a [`Page`](/bonzai/pr-1/doc/bonsai/storage/page/struct.Page.html) is nothing but its bytes, and its header is parsed into a [`Header`](/bonzai/pr-1/doc/bonsai/storage/page/struct.Header.html) whose fields mirror Postgres's `PageHeaderData` (most doc comments are omitted in the excerpts of this post):
+In `bonzai`, a [`Page`](/bonzai/part-1/doc/bonsai/storage/page/struct.Page.html) is nothing but its bytes, and its header is parsed into a [`Header`](/bonzai/part-1/doc/bonsai/storage/page/struct.Header.html) whose fields mirror Postgres's `PageHeaderData` (most doc comments are omitted in the excerpts of this post):
 
 ```rust
 /// An 8 KB block, exactly as stored on disk.
@@ -203,22 +204,21 @@ Here is how these fields map to the first 24 bytes of our page:
 
 In a few words:
 
-- `pd_lsn` is the position in the WAL just past the last record that changed the page. The accronym stands for _log sequence number_. It is what ties pages to the WAL: Postgres will not write a modified page to disk before the WAL has been flushed up to the page's LSN.
-- `pd_checksum` is the page's checksum, more on it below.
-- `pd_flags` holds a few hints, for example whether every row on the page is visible to every transaction.
-- `pd_lower`, `pd_upper` and `pd_special` are the boundaries of the diagram above. We have three line pointers, so `pd_lower` is 24 + 3 × 4 = 36. Heap pages have no special space, so `pd_special` is the end of the page.
+- `pd_lsn` is used to locate the page in the WAL.
+- `pd_checksum` is the page's checksum.
+- `pd_flags` holds hints about properties of the page.
+- `pd_lower`, `pd_upper` and `pd_special` are the boundaries of the diagram above.
 - `pd_pagesize_version` packs the page size and the version of the layout (4, since Postgres 8.3) into a single 16-bit integer.
 - `pd_prune_xid` tells Postgres when pruning the page might be worth it. Nothing was deleted yet, so there is nothing to prune.
 
-The [rustdocs](/bonzai/pr-1/doc/bonsai/storage/page/struct.Header.html) of the project goes into more details.
+The [rustdocs](/bonzai/part-1/doc/bonsai/storage/page/struct.Header.html) of the project goes into more details.
 
 ### Parsing the header
 
-Fields are stored in the byte order of the machine, which is little-endian on x86-64 and ARM64. `bonzai` assumes little-endian.
-The only quirk is the LSN, which Postgres stores as two 32-bit halves, high half first.
+Fields are stored in the byte order of the machine, `bonzai` assumes little-endian (see `read_u16` bellow).
+How the LSN is parsed is a bit convoluted for historical reasons:
 The LSN used to be handled as two 32-bit integers, a "log file" number and an offset within that file, so that the WAL could grow past 4 GB using only 32-bit integers.
 It has been a single 64-bit integer since Postgres 9.3, but pages still store the two halves so that the on-disk format did not change.
-In our page, `00 00 00 00` is the high half and `a8 42 b6 01` the low half, which Postgres prints as `0/1B642A8`.
 
 ```rust
 impl Header {
@@ -248,6 +248,11 @@ impl Header {
         Ok(header)
     }
 }
+
+fn read_u16(raw: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([raw[offset], raw[offset + 1]])
+}
+// fn read_u32 follows the same pattern
 ```
 
 Postgres does not trust what it reads from disk.
@@ -327,7 +332,7 @@ After restarting the server, the page is read back from disk, and the checksum s
 
 ## Validated pages
 
-The checks described so far are bundled in [`Page::try_validated_for_block`](/bonzai/pr-1/doc/bonsai/storage/page/struct.Page.html#method.try_validated_for_block), the counterpart of Postgres's [`PageIsVerified`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/page/bufpage.c#L63-L174).
+The checks described so far are bundled in [`Page::try_validated_for_block`](/bonzai/part-1/doc/bonsai/storage/page/struct.Page.html#method.try_validated_for_block), the counterpart of Postgres's [`PageIsVerified`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/page/bufpage.c#L63-L174).
 It returns a `ValidatedPage`, a page whose checksum and header have been checked for a given block.
 When Postgres extends a relation, it first writes pages of zeros to the file and initializes them in memory later, so a crash can leave all-zero pages behind. Such pages are therefore valid, even though they have no checksum:
 
@@ -357,7 +362,110 @@ pub fn try_validated_for_block<'a>(
 }
 ```
 
-On the write side, [`Page::try_set_checksum_for_block`](/bonzai/pr-1/doc/bonsai/storage/page/struct.Page.html#method.try_set_checksum_for_block) refuses pages with an invalid header, stamps the checksum and returns a `ValidatedPage` too.
+On the write side, [`Page::try_set_checksum_for_block`](/bonzai/part-1/doc/bonsai/storage/page/struct.Page.html#method.try_set_checksum_for_block) refuses pages with an invalid header, stamps the checksum and returns a `ValidatedPage` too.
+
+# Reading blocks from a fork ([PR #2](https://github.com/thenlevy/bonzai/pull/2))
+
+So far, we found our page by hand: we looked up the OID of the database and the `relfilenode` of the table, built the path of the file, and read 8192 bytes at the right offset.
+In Postgres, this is the job of the _storage manager_ ([`smgr.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/smgr.c) and [`md.c`](https://github.com/postgres/postgres/blob/master/src/backend/storage/smgr/md.c)), and PR #2 adds its `bonzai` counterpart, [`StorageManager`](/bonzai/part-1/doc/bonsai/storage/manager/struct.StorageManager.html).
+
+A block is addressed by its relation, its fork and its block number:
+
+```rust
+pub struct RelFileNumber(pub u32);
+
+pub enum ForkKind {
+    Main = 0,
+    FreeSpaceMap = 1,
+    VisibilityMap = 2,
+    Init = 3,
+}
+
+pub struct ForkIdentifier {
+    pub rel: RelFileNumber,
+    pub kind: ForkKind,
+}
+
+pub struct BlockIdentifier {
+    pub fork: ForkIdentifier,
+    pub block_number: BlockNumber,
+}
+```
+
+A `StorageManager` is opened on the directory of a database (`base/<database OID>`), and turns these addresses into a file and an offset, following the naming rules we saw above:
+
+```rust
+/// Path to the file holding the segment `segno` of `fork`.
+fn path(&self, fork: ForkIdentifier, segno: u32) -> PathBuf {
+    let mut name = fork.rel.0.to_string();
+    match fork.kind {
+        ForkKind::Main => {}
+        ForkKind::FreeSpaceMap => name.push_str("_fsm"),
+        ForkKind::VisibilityMap => name.push_str("_vm"),
+        ForkKind::Init => name.push_str("_init"),
+    }
+    if segno > 0 {
+        write!(&mut name, ".{segno}").unwrap();
+    }
+    self.dir.join(name)
+}
+
+fn position(&self, block: BlockNumber) -> Position {
+    let segno = block.0 / self.n_block_per_segment.0;
+    let offset = u64::from(block.0 % self.n_block_per_segment.0) * BLCKSZ as u64;
+    Position { segno, offset_bytes: offset }
+}
+```
+
+`n_block_per_segment` is normally `RELSEG_SIZE`, the number of blocks in 1 GB (131072), but it can be made smaller so that a few blocks are enough to span several segments.
+
+The subtle part is knowing how many blocks a fork has.
+Like Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285), `bonzai` opens the segments in order and adds up their sizes, stopping after the first segment that isn't full, since only the last segment of a fork can be partly full.
+A partly written block at the end of a file, which a crash in the middle of an extension can leave behind, doesn't count, and a segment larger than the segment size is an error.
+The segments of a fork are opened and counted once, then cached, and reading a block checks that it exists before reading it at its offset:
+
+```rust
+/// Fetch the block from the disk and store its bits into `page`.
+pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockError> {
+    let fork = self.get_fork(block.fork).map_err(|err| BlockError {
+        block,
+        inner: BlockErrorInner::ForkError(err),
+    })?;
+    if !fork.nb_blocks.contains(block.block_number) {
+        return Err(BlockError {
+            block,
+            inner: BlockErrorInner::BlockDoesNotExist {
+                fork_size: fork.nb_blocks,
+            },
+        });
+    }
+    let Position { segno, offset_bytes } = self.position(block.block_number);
+    fork.segments[segno as usize]
+        .read_exact_at(page, offset_bytes)
+        .map_err(|err| BlockError {
+            block,
+            inner: BlockErrorInner::Io(err),
+        })
+}
+```
+
+Putting the two PRs together, fetching and validating the page of our table takes a few lines:
+
+```rust
+let smgr = StorageManager::open("data/base/16384").unwrap();
+let block = BlockIdentifier {
+    fork: ForkIdentifier {
+        rel: RelFileNumber(16386),
+        kind: ForkKind::Main,
+    },
+    block_number: BlockNumber(0),
+};
+let mut page = Page { bytes: [0; BLCKSZ] };
+smgr.read(block, &mut page).unwrap();
+let validated = page.try_validated_for_block(block.block_number).unwrap();
+```
+
+`validated.page().header()` gives back the header we parsed above, and reading block 1 fails with `BlockDoesNotExist { fork_size: BlockCount(1) }`: our table has a single block.
 
 # Testing framework
 
@@ -365,7 +473,7 @@ Let's test our implementation against Postgres.
 For that, we need pages written by Postgres, and Postgres's own reading of them.
 Values such as the LSN or the checksum change from one cluster to the next, so they cannot be hard-coded in the tests.
 
-The PR therefore comes with a small testing framework, made of three pieces:
+PR #1 therefore comes with a small testing framework, made of three pieces:
 
 - **a script**, `make-db.sh`, which builds a fresh cluster and runs the fixtures against it;
 - **fixtures**, SQL scripts that set up some state in the cluster and record what Postgres says about it;
@@ -496,6 +604,34 @@ fn sealing_writes_back_what_postgres_wrote() {
 
 A last test checks that the page fails validation as block 1.
 
+PR #2 adds a test that needs no fixture of its own, [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
+It opens a `StorageManager` on the `postgres` database of the same cluster, and reads every block of every fork in it: the system catalogs and their B-tree indexes, their free space and visibility maps, and the relations created by the fixture: 300 forks and 929 blocks in all.
+Each block must have the same bytes as in its file and pass `try_validated_for_block`, and reading one block past the end of the fork must fail:
+
+```rust
+for entry in fs::read_dir(FIXTURE_DB).unwrap() {
+    let path = entry.unwrap().path();
+    let Some(fork) = fork_of(&path) else {
+        continue;
+    };
+    let file = fs::read(&path).unwrap();
+    let nb_blocks = (file.len() / BLCKSZ) as u32;
+    for (n, expected) in (0..).zip(file.chunks_exact(BLCKSZ)) {
+        let page = read(&smgr, fork, n).unwrap();
+        assert!(page.bytes == expected, "{path:?}: block {n} differs");
+        if let Err(err) = page.try_validated_for_block(BlockNumber(n)) {
+            panic!("{path:?}: {err}");
+        }
+    }
+    assert!(
+        is_past_the_end(&read(&smgr, fork, nb_blocks), nb_blocks),
+        "{path:?}"
+    );
+}
+```
+
+Here `fork_of` turns a file name such as `16385_fsm` into a `ForkIdentifier`, and skips other files such as `pg_filenode.map`.
+
 From the dev shell, building the cluster and running the tests is a matter of:
 
 ```sh
@@ -508,5 +644,5 @@ This is how we will check the next pieces of `bonzai` against Postgres.
 
 # What's next
 
-We can now read a page and tell whether Postgres would accept it, but we know nothing yet about what lies between `pd_lower` and `pd_upper`.
-Future posts will look at line pointers and tuples, then at the layers above pages: reading and writing the blocks of a fork, the buffer pool, the WAL, and of course B-trees.
+We can now read any block of a fork and tell whether Postgres would accept it, but we know nothing yet about what lies between `pd_lower` and `pd_upper`.
+Future posts will look at line pointers and tuples, then at writing and extending forks, the buffer pool, the WAL, and of course B-trees.
