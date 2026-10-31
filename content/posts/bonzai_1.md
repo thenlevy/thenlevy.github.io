@@ -697,5 +697,5 @@ Here `fork_of` turns a file name such as `16385_fsm` into a `ForkIdentifier`, an
 
 # What's next
 
-We can now read any block of a fork and tell whether Postgres would accept it, but we know nothing yet about what lies between `pd_lower` and `pd_upper`.
-Future posts will look at line pointers and tuples, then at writing and extending forks, the buffer pool, the WAL, and of course B-trees.
+We can now read any block of a fork and tell whether Postgres would accept it, but we do not know how to interpret the bytes past the header.
+In the next post, we will look at line pointers and tuples, and learn how to recover the rows stored in the page.
