@@ -16,31 +16,30 @@ This post accompanies the [first PR](https://github.com/thenlevy/bonzai/pull/1):
 
 ## Setting up a cluster
 
-Let's create a new _cluster_, that is to say a data directory managed by a single server, start a server on it, create a database and connect to it:
+Beffore digging into code, let's start by inspecting files actually created by Postgres.
+We start by creating a new _cluster_ (i.e. a collections of databases managed by a Postgres instance), and starting an instance to manage it.
+Then we create the `bonzai` database and connect to it:
 
 ```sh
+# Create a new cluster
+# --data-checksums makes Postgres store a checksum in every page, and is off by default before Postgres 18.
 initdb -D data --data-checksums -U postgres -A trust
+# Start the postgres instance
 pg_ctl -D data -l log start
+# Create the database
 createdb -U postgres bonzai
+# Connect to the database with the psql client
 psql -U postgres -d bonzai
 ```
 
-`--data-checksums` makes Postgres store a checksum in every page, we will come back to it later. It is off by default before Postgres 18.
-
-`initdb` creates three databases: `template0`, `template1` and `postgres`, and `createdb` adds ours, `bonzai`.
-In it, let's create a table with a few rows:
+Using the `psql` client, we create a table with a few rows, and we use the `CHECKPOINT` command to force the changes to be written to disk.
+The use of `CHECKPOINT` is necessary because Postgres does not write all changes to disk immediately and instead store them in a RAM buffer.
 
 ```sql
 CREATE TABLE t (id int8 GENERATED ALWAYS AS IDENTITY, payload text);
 INSERT INTO t (payload) VALUES ('Hello, World!'), ('Bonjour Bonsai'), ('An other row');
 CHECKPOINT;
 ```
-
-The last statement deserves an explanation.
-An `INSERT` does not write to the table's file directly.
-It modifies a copy of the page that lives in Postgres's shared memory (the _buffer pool_) and appends a record describing the change to the WAL.
-The modified page only reaches the table's file later, when the background writer or the checkpointer flushes it.
-`CHECKPOINT` forces every modified page to be written, so that the file reflects our inserts.
 
 ## Finding the file holding our table's data
 
@@ -57,35 +56,34 @@ bonzai=# SELECT oid, datname FROM pg_database;
 (4 rows)
 ```
 
-Each _relation_ (table, index, sequence, ...) of a database is associated to up to four _forks_:
+Each _relation_ (table, index, sequence, ...) of a database is associated with up to four _forks_:
 The _main fork_, that contains the actual data stored in the relation, and optionally the _free space map fork_ (`fsm`), the _visibility map fork_ (`vm`), and the _init fork_.
 
-We'll explore the `fsm` and `vm` forks when we'll discuss the functionning of the `VACUUM`.
+We'll explore the `fsm` and `vm` forks when we discuss how `VACUUM` works.
 
-Forked are named after the relation's `relfilenode`, which can be found in the `pg_class` catalog:
+Forks are named after the relation's `relfilenode`, which can be found in the `pg_class` catalog:
 
 ```text
-bonzai=# SELECT oid, relname, relkind, relfilenode FROM pg_class WHERE oid >= 16384 ORDER BY oid;
-  oid  |       relname        | relkind | relfilenode
--------+----------------------+---------+-------------
- 16385 | t_id_seq             | S       |       16385
- 16386 | t                    | r       |       16386
- 16389 | pg_toast_16386       | t       |       16389
- 16390 | pg_toast_16386_index | i       |       16390
-(4 rows)
+bonzai=# SELECT oid, relname, relfilenode FROM pg_class WHERE relname = 't';
+  oid  | relname | relfilenode
+-------+---------+-------------
+ 16386 | t       |       16386
+(1 row)
 ```
 
-Creating `t` created a few relations: the table itself (`relkind = 'r'`), the sequence behind its identity column, and a TOAST table with its index, where Postgres moves values that are too large to fit in a page.
+This tells us that the main fork of our table is called `16386`.
 
 Big forks of over 1GB are split into _segments_ each stored as a file of up to 1 GB.
-The first segement is stored in a file whose name is exactly the name of the fork, and the name of subsequent segments are suffixed with `.{idx}` where `idx` starts at 1 for the 2nd segment: `16386`, `16386.1`, `16386.2`, ...
+The first segment is stored in a file whose name is exactly the name of the fork, and the names of subsequent segments are suffixed with `.{idx}` where `idx` starts at 1 for the 2nd segment: `16386`, `16386.1`, `16386.2`, ...
 See [Database File Layout](https://www.postgresql.org/docs/current/storage-file-layout.html) in the Postgres documentation for the details.
 
 {{< callout type="note" icon="🕳️" title="OID or relfilenode?" >}}
 For now the table's `relfilenode` is equal to its OID, but the two diverge as soon as the table is rewritten (by a `TRUNCATE` or a `VACUUM FULL` for example): the new version of the table goes into a new file and the old file is deleted.
 {{< /callout >}}
 
-The `pg_relation_filepath` function does the lookup for us:
+For now our table is small, so we expect its data to live in `data/base/16384/16386`.
+
+We could also have reached this conclusion using the `pg_relation_filepath` function, which immediately gives us the result.
 
 ```text
 bonzai=# SELECT pg_relation_filepath('t');
@@ -95,14 +93,17 @@ bonzai=# SELECT pg_relation_filepath('t');
 (1 row)
 ```
 
-So our table lives in `data/base/16384/16386`.
-
-More precisely, this file holds the table's _main fork_, which contains the actual data stored in the table.
-A relation can have up to three other forks, stored in sibling files with a suffix: the free space map (`16386_fsm`) and the visibility map (`16386_vm`), which Postgres creates lazily (typically on the first `VACUUM`), and the init fork (`16386_init`) of unlogged tables.
+Forks segments, are sequences of blocks of `BLCKSZ` bytes, where `BLCKSZ` is a constant chosen when Postgres is compiled. In practice `BLCKSZ` is almost always 8192 bytes, and this is the value we'll use in `bonzai`.
 
 ## The first page
 
-Our main fork is 8192 bytes long:
+Block `n` of a fork starts at position `n * BLCKSZ` bytes from the start of the fork (counting across its segments), so our table currently has a single block.
+
+{{< callout type="note" icon="📄" title="Block or page?" >}}
+Postgres tends to use the word _block_ when talking about a position in a file and _page_ when referring to its content, but the two words are often used interchangeably.
+{{< /callout >}}
+
+Our table is small, so it's main fork is 8192 bytes long:
 
 ```text
 $ wc -c data/base/16384/16386
@@ -130,16 +131,10 @@ $ hexdump -C data/base/16384/16386
 00002000
 ```
 
-(If you follow along, the LSN, the checksum and the transaction IDs will differ on your machine.)
-
 Even without knowing anything about the format, a few things stand out: there is data at the very beginning of the file, data at the very end, and nothing but zeros in between (the `*` line means "same as the line above, repeated").
 Our three strings are at the end, in reverse order of insertion.
 
 # Anatomy of a page
-
-Every fork, whether it belongs to a table (which Postgres stores as an unordered _heap_) or to a B-tree index, is a sequence of blocks of `BLCKSZ = 8192` bytes, a constant chosen when Postgres is compiled.
-Block `n` of a fork is stored `n * 8192` bytes from the start of the fork (counting across its segments), so our table currently has a single block.
-Postgres tends to say _block_ when talking about a position in a file and _page_ when talking about its content, but the two words are often used interchangeably.
 
 All pages share the same layout, described in [bufpage.h](https://github.com/postgres/postgres/blob/master/src/include/storage/bufpage.h) and summarized in the documentation of `bonzai`'s [`page` module](/bonzai/pr-1/doc/bonsai/storage/page/index.html):
 
