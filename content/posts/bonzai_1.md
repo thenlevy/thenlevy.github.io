@@ -1,5 +1,5 @@
 ---
-date: "2026-10-29T21:00:00+01:00"
+date: "2026-10-31T23:55:00+01:00"
 draft: false
 title: "`bonzai` Part I: How Postgres stores pages on disk"
 description: "Finding the file behind a Postgres table, reading its first 8 KB page byte by byte, then fetching and parsing pages in Rust."
@@ -282,7 +282,7 @@ When the option is enabled (which is the case by default since Postgres 18), Pos
 A deep dive into the algorithm that computes the checksum would go beyond the scope of this series.
 What really matters is that `bonzai` computes exactly the same value as Postgres, which the tests below check.
 We therefore rely on an AI-generated translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h) to Rust.
-Still, one property is worth pointing out: the checksum validation function takes the block number into account, so a valid page written at the wrong place is caught (our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339).
+Still, one property is worth pointing out: the checksum takes the block number into account, so a valid page written at the wrong place is caught (our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339).
 
 ```rust
 /// The checksum `page` should carry when stored at `block`. The page's own
