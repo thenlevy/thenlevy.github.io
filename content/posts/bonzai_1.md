@@ -292,14 +292,11 @@ Header {
 
 ## Checksums
 
-With data checksums enabled, every page carries a 16-bit checksum of its content, computed when the page is written to disk and verified when it is read back.
-It is meant to detect corruption caused by the storage stack (disk, controller, file system), not to resist tampering.
+When the option is enabled (which is the case by default since Postgres 18), Postgres stores a 16-bit checksum in every page in order to detect data corruption.
 
 A deep dive into the algorithm that computes the checksum would go beyond the scope of this series.
 What really matters is that `bonzai` computes exactly the same value as Postgres, which the tests below check.
-
 We therefore rely on a AI generated translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h) to Rust.
-
 Still, one property is worth pointing out: the checksum validation function takes the block number into account, so a valid page written at the wrong place is caught (our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339).
 
 ```rust
