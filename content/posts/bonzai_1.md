@@ -138,7 +138,7 @@ Before we dive into the details of how to interpret those bytes, we can already 
 
 - There are non-zero bytes at the very beginning of the file.
 - Then a long empty region.
-- Then a non-empty region, that notably contains the three strings that we inserted into the table, in reverse order of insertion.
+- Then a non-empty region, which notably contains the three strings that we inserted into the table, in reverse order of insertion.
 
 # Anatomy of a page ([PR #1](https://github.com/thenlevy/bonzai/pull/1))
 
@@ -275,28 +275,13 @@ impl XLogRecPtr {
 const _: () = assert!(size_of::<Option<XLogRecPtr>>() == size_of::<u64>());
 ```
 
-Reading our page with these types gives:
-
-```text
-Header {
-    lsn: Some(XLogRecPtr(0x1B642A8)),
-    checksum: 13339,
-    flags: PageFlags { has_free_lines: false, page_full: false, all_visible: false },
-    lower: LocationIndex(36),
-    upper: LocationIndex(8048),
-    special: LocationIndex(8192),
-    pagesize_version: 8196,
-    prune_xid: None,
-}
-```
-
 ## Checksums
 
 When the option is enabled (which is the case by default since Postgres 18), Postgres stores a 16-bit checksum in every page in order to detect data corruption.
 
 A deep dive into the algorithm that computes the checksum would go beyond the scope of this series.
 What really matters is that `bonzai` computes exactly the same value as Postgres, which the tests below check.
-We therefore rely on a AI generated translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h) to Rust.
+We therefore rely on an AI-generated translation of the C code in [checksum_impl.h](https://github.com/postgres/postgres/blob/master/src/include/storage/checksum_impl.h) to Rust.
 Still, one property is worth pointing out: the checksum validation function takes the block number into account, so a valid page written at the wrong place is caught (our page validates as block 0, but as block 1 the computed checksum would be 13340 instead of 13339).
 
 ```rust
@@ -330,7 +315,8 @@ After restarting the server, the page is read back from disk, and the checksum s
 
 The checks described so far are bundled in [`Page::try_validated_for_block`](/bonzai/part-1/doc/bonsai/storage/page/struct.Page.html#method.try_validated_for_block), the counterpart of Postgres's [`PageIsVerified`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/page/bufpage.c#L63-L174).
 It returns a `ValidatedPage`, a page whose checksum and header have been checked for a given block.
-When Postgres extends a relation, it first writes pages of zeros to the file and initializes them in memory later, so a crash can leave all-zero pages behind. Such pages are therefore valid, even though they have no checksum:
+When Postgres extends a relation, it first writes pages of zeros to the file and initializes them in memory later, so a crash can leave all-zero pages behind. Such pages are therefore valid, even though they have no checksum.
+A page whose `pd_upper` is 0 has never been initialized, and is accepted only if all its bytes are zero:
 
 ```rust
 pub fn try_validated_for_block<'a>(
@@ -344,17 +330,8 @@ pub fn try_validated_for_block<'a>(
             Err(PageError::InvalidHeader { block })
         };
     }
-    // Read on its own, so that a checksum mismatch is reported even when
-    // `header()` rejects the header.
-    let stored = read_u16(self, PD_CHECKSUM.start);
-    let computed = checksum_page(self, block);
-    if stored != computed {
-        return Err(PageError::ChecksumMismatch { block, stored, computed });
-    }
-    if self.header().is_err() {
-        return Err(PageError::InvalidHeader { block });
-    }
-    Ok(ValidatedPage { page: Cow::Borrowed(self), block })
+    // Otherwise, the checksum must match and the header must be valid.
+    // ...
 }
 ```
 
@@ -437,52 +414,12 @@ Since it creates no database first, the identity sequence takes OID 16384 and th
 
 ## Comparing with `bonzai`
 
-On the Rust side, [`tests/postgres.rs`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/postgres.rs) reads the facts, loads block 0 of the file they point to, and builds the header `pageinspect` saw:
+On the Rust side, [`tests/postgres.rs`](https://github.com/thenlevy/bonzai/blob/e41e161d3f9617ac9da8c68c2bd6c8b20833edc9/tests/postgres.rs) reads the facts, loads block 0 of the file they point to into `POSTGRES.page`, and builds the header `pageinspect` saw into `POSTGRES.header`.
+
+The tests check that `bonzai` reads the same header as `pageinspect`, that it computes the same checksum as Postgres, and that the page fails validation as block 1.
+The most interesting one clears the checksum, seals the page again, and checks that `bonzai` writes back exactly the bytes Postgres wrote:
 
 ```rust
-static POSTGRES: LazyLock<Fixture> = LazyLock::new(|| {
-    let facts = Facts::read("postgres-heap-page");
-    let path: String = facts.get("path");
-    let file = read(&format!("data/{path}"));
-    let block = file
-        .get(..BLCKSZ)
-        .unwrap_or_else(|| panic!("{path} is shorter than a block"));
-    Fixture {
-        page: Page {
-            bytes: block.try_into().unwrap(),
-        },
-        header: Header {
-            lsn: XLogRecPtr::from_raw(facts.get("lsn")),
-            checksum: facts.get("checksum"),
-            // ...
-        },
-    }
-});
-```
-
-The tests then check that `bonzai` reads the same header as `pageinspect`, computes the same checksum as Postgres, and writes back exactly the bytes Postgres wrote when it seals the page again:
-
-```rust
-#[test]
-fn header_reads_like_pageinspect() {
-    assert_eq!(POSTGRES.page.header(), Ok(POSTGRES.header));
-}
-
-#[test]
-fn checksum_matches_postgres() {
-    assert_ne!(POSTGRES.header.checksum, 0, "checksums are off");
-    assert_eq!(
-        checksum_page(&POSTGRES.page, BlockNumber(0)),
-        POSTGRES.header.checksum
-    );
-    assert!(
-        POSTGRES
-            .page
-            .try_validated_for_block(BlockNumber(0))
-            .is_ok()
-    );
-}
-
 #[test]
 fn sealing_writes_back_what_postgres_wrote() {
     let mut page = POSTGRES.page.clone();
@@ -494,8 +431,6 @@ fn sealing_writes_back_what_postgres_wrote() {
     assert_eq!(sealed.page(), &POSTGRES.page);
 }
 ```
-
-A last test checks that the page fails validation as block 1.
 
 # Reading blocks from a fork ([PR #2](https://github.com/thenlevy/bonzai/pull/2))
 
@@ -527,129 +462,16 @@ pub struct BlockIdentifier {
 }
 ```
 
-A `StorageManager` is opened on the directory of a database (`base/<database OID>`), and turns these addresses into a file and an offset, following the naming rules we saw above:
+A `StorageManager` is opened on the directory of a database (`base/<database OID>`), and turns these addresses into a file and an offset, following the naming rules we saw above.
 
-```rust
-/// Path to the file holding the segment `segno` of `fork`.
-fn path(&self, fork: ForkIdentifier, segno: u32) -> PathBuf {
-    let mut name = fork.rel.0.to_string();
-    match fork.kind {
-        ForkKind::Main => {}
-        ForkKind::FreeSpaceMap => name.push_str("_fsm"),
-        ForkKind::VisibilityMap => name.push_str("_vm"),
-        ForkKind::Init => name.push_str("_init"),
-    }
-    if segno > 0 {
-        write!(&mut name, ".{segno}").unwrap();
-    }
-    self.dir.join(name)
-}
+To know how many blocks a fork has, `bonzai` follows the rules of Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285):
 
-fn position(&self, block: BlockNumber) -> Position {
-    let segno = block.0 / self.n_block_per_segment.0;
-    let offset = u64::from(block.0 % self.n_block_per_segment.0) * BLCKSZ as u64;
-    Position { segno, offset_bytes: offset }
-}
-```
+- Segments are opened in order, until one is missing or isn't full: only the last segment of a fork can be partly filled.
+- A partly written block at the end of a segment, left by a crash, doesn't count.
+- A segment holding more than 1 GB of blocks is an error.
 
-When loading a fork, `bonzai` mimics Postgres's [`mdnblocks`](https://github.com/postgres/postgres/blob/cab16d214bc5b70dd3514c5631ffa1f0acb3fed3/src/backend/storage/smgr/md.c#L1224-L1285): it opens the segments in order and stops after the first segment that isn't full (only the last segment of a fork can be partially filled).
-
-```rust
-fn load_fork(&self, fork: ForkIdentifier) -> Result<OpenFork, ForkError> {
-    let empty = OpenFork {
-        segments: Vec::new(),
-        nb_blocks: BlockCount(0),
-    };
-    let mut previous_full = true;
-    (0..)
-        // Stops at the first missing segment, or after the first one that
-        // isn't full: only the last segment can be partly full.
-        .map_while(|segno| {
-            if !previous_full {
-                return None;
-            }
-            let segment = self.open_segment(fork, segno).transpose()?;
-            previous_full = segment
-                .as_ref()
-                .is_ok_and(|segment| segment.nb_blocks == self.n_block_per_segment);
-            Some(segment)
-        })
-        .try_fold(empty, |mut open, segment| {
-            let segment = segment?;
-            open.segments.push(segment.file);
-            open.nb_blocks.0 += segment.nb_blocks.0;
-            Ok(open)
-        })
-}
-
-/// Opens segment `segno` of `fork` and counts its blocks. `None` if there
-/// is no such segment, except for segment 0: a missing fork is an error.
-fn open_segment(&self, fork: ForkIdentifier, segno: u32) -> Result<Option<Segment>, ForkError> {
-    let path = self.path(fork, segno);
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        // The previous segment was full and nothing comes after it.
-        Err(err) if segno > 0 && err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(ForkError {
-                fork,
-                inner: ForkErrorInner::Io(err),
-            });
-        }
-    };
-    // A partly written block at the end, left by a crash, doesn't
-    // count, as in `mdnblocks`.
-    let file_size = file
-        .metadata()
-        .map_err(|err| ForkError {
-            fork,
-            inner: err.into(),
-        })?
-        .len();
-    let blocks = file_size / (BLCKSZ as u64);
-    if blocks > u64::from(self.n_block_per_segment.0) {
-        return Err(ForkError {
-            fork,
-            inner: ForkErrorInner::SegmentFileInconsistentlyBig {
-                path,
-                file_size,
-                n_blocks_per_segment: self.n_block_per_segment,
-            },
-        });
-    }
-    Ok(Some(Segment {
-        file,
-        nb_blocks: BlockCount(blocks as u32),
-    }))
-}
-```
-
-The segments of a fork are opened and counted once, then cached, and reading a block checks that it exists before reading it at its offset:
-
-```rust
-/// Fetch the block from the disk and store its bits into `page`.
-pub fn read(&self, block: BlockIdentifier, page: &mut Page) -> Result<(), BlockError> {
-    let fork = self.get_fork(block.fork).map_err(|err| BlockError {
-        block,
-        inner: BlockErrorInner::ForkError(err),
-    })?;
-    if !fork.nb_blocks.contains(block.block_number) {
-        return Err(BlockError {
-            block,
-            inner: BlockErrorInner::BlockDoesNotExist {
-                fork_size: fork.nb_blocks,
-            },
-        });
-    }
-    let Position { segno, offset_bytes } = self.position(block.block_number);
-    fork.segments[segno as usize]
-        .read_exact_at(page, offset_bytes)
-        .map_err(|err| BlockError {
-            block,
-            inner: BlockErrorInner::Io(err),
-        })
-}
-```
+See [`load_fork`](https://github.com/thenlevy/bonzai/blob/1c543bb6beeb1c82a296bfe8c3fa7f712f560db1/src/storage/manager.rs#L139-L205) for the implementation.
+The segments of a fork are opened and counted once, then cached, and [`read`](/bonzai/part-1/doc/bonsai/storage/manager/struct.StorageManager.html#method.read) checks that a block exists before reading it at its offset.
 
 # Putting it all together
 
@@ -669,31 +491,7 @@ smgr.read(block, &mut page).unwrap();
 let validated = page.try_validated_for_block(block.block_number).unwrap();
 ```
 
-We run this check on every block of every fork in the `postgres` database of the cluster built by `make-db.sh` in [`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/549d6ccd65389cd4151e51ab39f523fe7673e0ac/tests/storage_manager.rs).
-
-```rust
-for entry in fs::read_dir(FIXTURE_DB).unwrap() {
-    let path = entry.unwrap().path();
-    let Some(fork) = fork_of(&path) else {
-        continue;
-    };
-    let file = fs::read(&path).unwrap();
-    let nb_blocks = (file.len() / BLCKSZ) as u32;
-    for (n, expected) in (0..).zip(file.chunks_exact(BLCKSZ)) {
-        let page = read(&smgr, fork, n).unwrap();
-        assert!(page.bytes == expected, "{path:?}: block {n} differs");
-        if let Err(err) = page.try_validated_for_block(BlockNumber(n)) {
-            panic!("{path:?}: {err}");
-        }
-    }
-    assert!(
-        is_past_the_end(&read(&smgr, fork, nb_blocks), nb_blocks),
-        "{path:?}"
-    );
-}
-```
-
-Here `fork_of` turns a file name such as `16385_fsm` into a `ForkIdentifier`, and skips other files such as `pg_filenode.map`.
+[`tests/storage_manager.rs`](https://github.com/thenlevy/bonzai/blob/1c543bb6beeb1c82a296bfe8c3fa7f712f560db1/tests/storage_manager.rs) runs this on the cluster built by `make-db.sh`: every block of every fork in its `postgres` database reads back identical to the file and validates, and reading one block past the end fails.
 
 # What's next
 
