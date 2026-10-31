@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["RELSEG_SIZE"],"enum":["BlockErrorInner","ForkErrorInner","ForkKind"],"struct":["BlockError","BlockIdentifier","ForkError","ForkIdentifier","RelFileNumber","StorageManager"]};

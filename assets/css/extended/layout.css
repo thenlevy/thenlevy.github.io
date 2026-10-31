@@ -12,3 +12,11 @@
     margin-inline: 0.08em;
     padding: 0.12em 0.35em;
 }
+
+/* Code blocks scroll horizontally on screen, but can't on paper: wrap them when printing. */
+@media print {
+    .post-content pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+}
