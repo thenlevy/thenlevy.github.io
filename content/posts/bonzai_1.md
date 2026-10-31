@@ -42,9 +42,9 @@ It modifies a copy of the page that lives in Postgres's shared memory (the _buff
 The modified page only reaches the table's file later, when the background writer or the checkpointer flushes it.
 `CHECKPOINT` forces every modified page to be written, so that the file reflects our inserts.
 
-## Finding the table's file
+## Finding the file holding our table's data
 
-Everything a cluster stores lives under its data directory, and each database gets a subdirectory of `base/` named after the database's OID (Object IDentifier):
+Everything a cluster stores lives under its `data` directory, and each database gets a subdirectory of `base/` named after the database's OID (Object IDentifier):
 
 ```text
 bonzai=# SELECT oid, datname FROM pg_database;
@@ -57,7 +57,12 @@ bonzai=# SELECT oid, datname FROM pg_database;
 (4 rows)
 ```
 
-Inside its database's directory, each _relation_ (table, index, sequence, ...) is stored in files named after the relation's `relfilenode`, which can be found in the `pg_class` catalog:
+Each _relation_ (table, index, sequence, ...) of a database is associated to up to four _forks_:
+The _main fork_, that contains the actual data stored in the relation, and optionally the _free space map fork_ (`fsm`), the _visibility map fork_ (`vm`), and the _init fork_.
+
+We'll explore the `fsm` and `vm` forks when we'll discuss the functionning of the `VACUUM`.
+
+Forked are named after the relation's `relfilenode`, which can be found in the `pg_class` catalog:
 
 ```text
 bonzai=# SELECT oid, relname, relkind, relfilenode FROM pg_class WHERE oid >= 16384 ORDER BY oid;
@@ -71,6 +76,10 @@ bonzai=# SELECT oid, relname, relkind, relfilenode FROM pg_class WHERE oid >= 16
 ```
 
 Creating `t` created a few relations: the table itself (`relkind = 'r'`), the sequence behind its identity column, and a TOAST table with its index, where Postgres moves values that are too large to fit in a page.
+
+Big forks of over 1GB are split into _segments_ each stored as a file of up to 1 GB.
+The first segement is stored in a file whose name is exactly the name of the fork, and the name of subsequent segments are suffixed with `.{idx}` where `idx` starts at 1 for the 2nd segment: `16386`, `16386.1`, `16386.2`, ...
+See [Database File Layout](https://www.postgresql.org/docs/current/storage-file-layout.html) in the Postgres documentation for the details.
 
 {{< callout type="note" icon="🕳️" title="OID or relfilenode?" >}}
 For now the table's `relfilenode` is equal to its OID, but the two diverge as soon as the table is rewritten (by a `TRUNCATE` or a `VACUUM FULL` for example): the new version of the table goes into a new file and the old file is deleted.
@@ -88,10 +97,8 @@ bonzai=# SELECT pg_relation_filepath('t');
 
 So our table lives in `data/base/16384/16386`.
 
-More precisely, this file holds the table's _main fork_, which contains the rows themselves.
+More precisely, this file holds the table's _main fork_, which contains the actual data stored in the table.
 A relation can have up to three other forks, stored in sibling files with a suffix: the free space map (`16386_fsm`) and the visibility map (`16386_vm`), which Postgres creates lazily (typically on the first `VACUUM`), and the init fork (`16386_init`) of unlogged tables.
-Each fork is also split into segments of 1 GB: `16386`, `16386.1`, `16386.2`, ...
-See [Database File Layout](https://www.postgresql.org/docs/current/storage-file-layout.html) in the Postgres documentation for the details.
 
 ## The first page
 
